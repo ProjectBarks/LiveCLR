@@ -2625,9 +2625,161 @@ run?*
 the test goes red. Every fix in the later rounds was validated that way, and it caught #2 and #3
 directly. Static reading of the test never did.
 
+> **Writing the lesson down did not transfer it.** The strongest evidence for that claim is #6's
+> sequel. `strings.text.absent` carries a comment in its own source recording exactly this bug and
+> exactly how it was fixed — *"Hardcoding the authored count let a driver drop sixteen of seventeen
+> text-less nodes and still be told 17/17."* Three rounds later `geometry.absent` was written, by the
+> same author, with an `if (!got) continue;` that shrinks its denominator the same way: rename one
+> bare node and it reports **"1/1 non-Control node(s) reported no geometry"** — full coverage over
+> half the population.
+>
+> A documented lesson sitting beside the code did not prevent its immediate recurrence. What
+> prevented it was a **fault that tries to exploit it** — `drop-bare-node` — which fails the moment
+> the fix is reverted. The general form: *a lesson is only installed when something automated tries
+> to violate it.* Prose is a reminder to whoever already remembers.
+>
+> The same blind spot also produced a wrong forecast twice: a predicted score drop that could not
+> happen, because the reasoning was about the fix's effect on the **target** without checking the
+> **check's denominator**. Predicting the effect of a change without asking what the measurement
+> actually iterates is the same error as the six above, pointed at a forecast instead of at code.
+
 A corollary that shaped a decision rather than a bug fix: the four 4.3 grid cells cap at 18/18 because
 `profiles.json` ships no 4.3 column, leaving every 4.3 offset uncorroborated. Transcribing the
 calibrator's own output into that column would raise the score to 19/19 and would be **anti-evidence**
 — `profile.agreement` would then pass by construction forever, a check that cannot fail, installed
 deliberately. The honest sources are the getter decoder (§13.2, independent of bracketing) or nothing.
 **The cap is information; removing it by fiat would destroy the information and keep the number.**
+
+---
+
+## 14. Statics on .NET 9 — §5.5 was wrong, and scry's CLR layer is where it shows
+
+**§5.5 records that static field addresses have "no route and no calibration anchor — ClrMD
+required." That is wrong on both counts.** Scry has the route, and the anchor exists and closes a
+loop on a value we already hold. This unblocks `.Static("Instance")` without `DomainLocalModule`
+(which no longer exists on .NET 9) and without ClrMD.
+
+Worth stating why this was missed: §4.6b's exhaustive Godot-layer enumeration concluded scry was
+hand-measured with nothing to teach, and that negative result was load-bearing — it justified building
+the calibrator. The mistake was generalising it. **The Godot layer and the CLR layer are not the same
+quality of work**, and the CLR layer had never been enumerated.
+
+### 14.1 The chain — `DotNetCoreFieldDesc::getStaticValue` (`FUN_180032730`)
+
+`DotNetCoreClass.get(name)` is a static-field read, and it is already used in this project's
+production path (`scryObject.ts:512,534`). Every read is `ReadProcessMemory` through scry's vtable.
+
+```
+isStatic = (u32(fd+8)  >> 24) & 1          FieldDesc m_isStatic  -> else empty
+isRVA    = (u32(fd+8)  >> 26) & 1          FieldDesc m_isRVA
+offset   =  u32(fd+0xC) & 0x07FFFFFF       FieldDesc m_dwOffset
+type     =  u32(fd+0xC) >> 27              FieldDesc m_type
+mt       =  ptr(fd+0)                      FieldDesc m_pMTOfEnclosingClass
+
+isDynamicStatics = .NET>=9 : (u32(mt+8) >> 1) & 1     MethodTable m_wFlags2 & 0x0002
+                   .NET<9  : (u32(mt+0) & 6) != 0     m_dwFlags & enum_flag_StaticsMask
+
+aux  = ptr(mt + 0x20)                      MethodTable m_pAuxiliaryData
+base = ptr(aux - 0x18) & ~1                GC statics      (type CLASS 0x12 / VALUETYPE 0x11)
+base = ptr(aux - 0x10) & ~1                non-GC statics  (everything else)
+addr = base + offset
+```
+
+**Verified against .NET 9 source, not guessed.** `release/9.0` `methodtable.h` defines
+`struct DynamicStaticsInfo { TADDR m_pGCStatics; TADDR m_pNonGCStatics; PTR_MethodTable m_pMethodTable; }`
+with `GetDynamicStaticsInfo(aux) = aux - sizeof(DynamicStaticsInfo)` and
+`STATICSPOINTERMASK = ~ISCLASSNOTINITED`, `ISCLASSNOTINITED = 1`. Scry's `aux-0x18` / `aux-0x10` /
+`& ~1` is that verbatim, and its version gate is `MethodTable::IsDynamicStatics()` on both branches —
+a faithful port of `FieldDesc::GetBase()`'s dispatch, not a measured constant.
+
+### 14.2 The calibration anchor §5.5 says does not exist
+
+`DynamicStaticsInfo`'s third member is a **back-pointer to the MethodTable**:
+
+```
+aux = ptr(MethodTable + 0x20)
+assert ptr(aux - 0x08) == MethodTable      <-- closes the loop on a value already held
+```
+
+That is structurally identical to the `EEClass.MethodTable` trick §5.5 already uses to resolve the
+`EEClassOrCanonMT` union tag. So **`MT+0x20` need not be trusted — it can be searched and confirmed**,
+sweeping the three or four candidate slots between the descriptor-published `Module = 24` and
+`EEClassOrCanonMT = 40` until the back-pointer matches. One derived offset instead of a table.
+
+Guard with `MTFlags2 & 0x0002`. If that bit is clear on .NET 9 the type has no statics at all, so the
+guard produces a **correct refusal rather than a garbage read** — which is the property the whole
+project is built on.
+
+### 14.3 Recommended design — descriptor-anchored at both ends, calibrated in the middle
+
+```
+object -> m_pMethTab & ~ObjectToMethodTableUnmask     (descriptor-published)
+       -> MTFlags2 & 0x0002 gate                      (published offset, contract-documented flag)
+       -> DERIVE m_pAuxiliaryData: sweep slots between Module=24 and EEClassOrCanonMT=40
+          for the one whose -8 back-pointer equals the MethodTable
+       -> ptr(aux-0x18) & ~1  /  ptr(aux-0x10) & ~1
+```
+
+Plus the `Object`/`String` MethodTable sanity checks §5.5 already mandates. Keep the cDAC descriptor
+as the anchor; this adds statics with **one calibrated offset**, and it fails closed.
+
+### 14.4 Corrections to the doc
+
+**"Scry has no version handling" is true of the Godot layer and false of the CLR layer.** There are
+**21 `major >= 9` gates across 14 functions** in the CLR layer, against 18 `isDebug` gates in the
+Godot layer. Minor and patch are stored (ModuleImpl `+0x42`/`+0x44`) and, as in the Godot layer,
+**never read** — writes only, binary-wide. So the CLR layer is version-aware, at exactly one
+boundary: .NET 9.
+
+**The `g_dacTable` table indexes four structures, not one.** §4.5 sketched it as a `Module` offset
+table. `FUN_180039930` is a 44-entry jump table (IDs `0x00`–`0x2b`) whose entries index `DacGlobals`
+slot byte-offsets, `AppDomain`, assembly-list entries, and `Module`. **Only 9 IDs are reachable** —
+13 call sites across 8 functions, every one passing an immediate, no dynamic ID anywhere. **35 of 44
+entries are dead code.**
+
+**Slot 21 is proven, not inferred.** `g_dacTable` is exported from the shipped `coreclr.dll` at RVA
+`0x3dde50`, lives in `.rdata`, and is statically relocated:
+
+```
+g_dacTable + 0xa8  =  slot 21  =  0x180462780  ==  pointer_data[1]  ==  descriptor global "AppDomain"
+```
+
+Twelve slots cross-match the descriptor's `pointer_data` exactly (16 ThreadStore, 17 FinalizerThread,
+18 GCThread, 21 AppDomain, 30 ArrayBoundsZero, 44 ObjectMethodTable, 47 StringMethodTable,
+51 ExceptionMethodTable, 58 FreeObjectMethodTable, 84 SyncTableEntries, 95/96 MiniMetaData). Slot 46
+— scry's `<9` constant — is a different address on this build, which is precisely why the gate exists.
+
+### 14.5 Native → managed is simpler than assumed
+
+```
+scriptInstance = ptr(node + (isDebug ? 0x70 : 0x68))
+handle         = ptr(scriptInstance + 0x20)
+managedObject  = ptr(handle)
+```
+
+A CoreCLR `OBJECTHANDLE` is an `Object**`, so a strong GCHandle is **one dereference**. No
+handle-table walk, no handle-type decoding, no object-header or SyncBlock work, and — searched across
+all 2,488 functions — **no `& ~7` mask on `Object.m_pMethTab` anywhere in the CLR layer.**
+
+### 14.6 Scry never touches the cDAC descriptor
+
+Stated plainly, because the negative is load-bearing: zero hits for `DotNetRuntimeContractDescriptor`,
+`cdac`, `DacGlobals` or `g_CLREngineMetrics` as ASCII, as UTF-16, or as the 8-byte stack-built
+fragments MSVC emits — the method that *does* find `"g_dacTable"` itself. Scry is purely `g_dacTable`
+with hardcoded slot ordinals, which is the fragility §4.5 describes. **The project's descriptor route
+is strictly better and this confirms it.**
+
+### 14.7 What is not worth taking
+
+The `g_dacTable` bootstrap (the descriptor is better and already proven live). The metadata reader —
+scry reaches ECMA-335 rows through the runtime's private `CMiniMd` internals with ~8 hardcoded
+offsets, where §12.4d already proved the cleaner route of reading the module's own metadata blob;
+notably there is **no `BSJB`, no `#~`, no `#Strings`** anywhere in the binary, so scry never parses a
+metadata blob itself. The 35 dead table entries. And one outright defect: on the
+`!isDynamicStatics` primitive path scry sets `base = fd` — the FieldDesc's own address as a static
+base, which is not a valid address. It is a stub. It never fires on .NET 9, where any type with
+statics carries `DynamicStatics`, which is why nobody noticed.
+
+`EEClass + 0x18 = m_pFieldDescList`, `sizeof(FieldDesc) = 0x10`, and the FieldDesc bitfields are
+worth taking as **calibration hypotheses to test first**, not as hardcodes — `EEClass+0x18` sits
+immediately after the descriptor-published `EEClass.MethodTable = 16`.
