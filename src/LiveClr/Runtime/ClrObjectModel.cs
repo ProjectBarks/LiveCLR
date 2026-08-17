@@ -338,6 +338,20 @@ public sealed class ClrArray : IClrArray
         ElementSize = context.TypeSystem.ComponentSizeIsTrusted ? type.ComponentSize : 0;
         ReportedCount = ReadCount(context, address);
 
+        if (ElementSize > 0 && ReportedCount > 0 && !LastElementIsMapped(context, address, ReportedCount, ElementSize))
+        {
+            // A count is a DECODED number, and a wrong decode of the header — or of the field
+            // offset that led here — produces an enormous one rather than an obviously invalid
+            // one. Nothing above this bounded it: the only rejection was `> int.MaxValue`, so a
+            // count of a billion travelled onward intact and any consumer that walked the array
+            // spun instead of failing. A bad decode has to fail fast (§12.5, §13.11).
+            context.NoteAnomaly(
+                $"array at 0x{address:X} claims {ReportedCount} elements of {ElementSize} bytes, but the slot that " +
+                "many elements in is not mapped, so this is a bad decode rather than a large array");
+            Count = 0;
+            return;
+        }
+
         if (ElementSize > 0 || ReportedCount == 0)
         {
             Count = ReportedCount;
@@ -379,6 +393,30 @@ public sealed class ClrArray : IClrArray
 
             return new ClrValue(_context, slot, _elementShape);
         }
+    }
+
+    /// <summary>
+    /// True when the LAST element's slot can actually be read.
+    /// </summary>
+    /// <remarks>
+    /// One read, and only when it can disagree. If the whole array fits inside the page the
+    /// count was just read from, that page is already known to be mapped and the probe could
+    /// not come out any way but true — which is the shape of check §13.11 is about, so it is
+    /// skipped rather than performed for appearances.
+    /// </remarks>
+    private static bool LastElementIsMapped(ISnapshotContext context, ulong address, int count, int elementSize)
+    {
+        const ulong PageSize = 4096;
+
+        ulong first = address + (ulong)context.TypeSystem.Layouts.ArrayFirstElementOffset;
+        ulong last = first + ((ulong)(count - 1) * (ulong)elementSize);
+
+        // Wrapped the address space, so no allocation could hold it.
+        if (last < address) return false;
+        if (last / PageSize == address / PageSize) return true;
+
+        Span<byte> probe = stackalloc byte[1];
+        return context.Memory.TryRead(last, probe);
     }
 
     private static int ReadCount(ISnapshotContext context, ulong address)

@@ -70,8 +70,12 @@ public sealed class HostileMetadataTests
         var (provider, resolver) = SyntheticMetadata.ResolverOver(blob);
         using (provider)
         {
+            // Three rows written, three names out: <Module>, A and B. Comparing against
+            // resolver.TypeCount would have compared the enumeration to the collection it
+            // enumerates, which agrees however many rows are dropped (§13.11).
             List<string> names = [.. resolver.EnumerateTypeNames()];
-            Assert.Equal(resolver.TypeCount, names.Count);
+            Assert.Equal(3, names.Count);
+            Assert.Equal(3, resolver.TypeCount);
 
             // Each side terminates at the repeat rather than ping-ponging forever.
             Assert.Contains("A+B", names);
@@ -106,9 +110,16 @@ public sealed class HostileMetadataTests
             List<string> names = [.. resolver.EnumerateTypeNames()];
             int longest = names.Max(n => n.Split('+').Length);
 
-            // Bounded output, and bounded EXACTLY at the cap — an inequality alone would
-            // still pass if the chain were silently not being followed at all.
-            Assert.Equal(TypeResolver.MaxNestingDepth + 1, longest);
+            // Bounded output, and bounded EXACTLY at the cap. The number is written out
+            // rather than derived from TypeResolver.MaxNestingDepth: an expectation computed
+            // from the constant under test agrees with whatever that constant becomes, so it
+            // held for every cap between 3 and 3999 and could not fail (§13.11 species 3).
+            //
+            // 65 = 64 segments accumulated by the walk, plus the segment it stops on. If the
+            // cap ever moves deliberately, BOTH lines below change together and the diff says
+            // so; if it moves by accident, this one fails.
+            Assert.Equal(65, longest);
+            Assert.Equal(64, TypeResolver.MaxNestingDepth);
         }
     }
 

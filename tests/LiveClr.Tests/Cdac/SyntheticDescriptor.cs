@@ -107,13 +107,22 @@ internal static class SyntheticDescriptor
     /// The whole §12.1 scenario in one call: a coreclr-like module at an ASLR'd base
     /// exporting the descriptor, the header, the real JSON blob, and pointer_data.
     /// </summary>
-    public static FakeMemory BuildTarget(string? json = null)
+    /// <param name="json">Blob to publish; the verbatim §5.2 fixture when omitted.</param>
+    /// <param name="magic">
+    /// Header magic. Overridable so that a magic test can run against a target that is
+    /// <em>otherwise entirely valid</em> — blob and pointer_data both mapped and readable —
+    /// which is the only arrangement in which the magic check is the thing doing the
+    /// refusing. Mapping the 40-byte header alone leaves <c>jsonAddress</c> pointing at
+    /// nothing, so the read fails thirty lines later whether the magic is checked or not
+    /// (§13.11).
+    /// </param>
+    public static FakeMemory BuildTarget(string? json = null, string magic = "DNCCDAC")
     {
         byte[] jsonBytes = Encoding.UTF8.GetBytes(json ?? DescriptorFixture.Json);
 
         return new FakeMemory()
             .Map(SyntheticPe.DefaultImageBase, SyntheticPe.BuildCoreClrLike())
-            .Map(DescriptorAddress, Header64(jsonBytes.Length))
+            .Map(DescriptorAddress, Header64(jsonBytes.Length, magic: magic))
             .Map(JsonAddress, jsonBytes)
             .Map(PointerDataAddress, Pointers64(PointerData));
     }

@@ -72,6 +72,22 @@ public readonly record struct MetadataBaseType(
 /// guarded — they are write-once-per-key, so contention is confined to first touch.
 /// </para>
 /// <para>
+/// <b>What "write-once" is worth, precisely.</b> Two callers racing on a cold key may both
+/// build a value; the one that reaches the lock first publishes, and the other discards its own
+/// work and returns the published instance. So every caller of
+/// <see cref="GetFields"/>/<see cref="GetFieldNames"/>/<see cref="GetFullName"/> for a given key
+/// receives the SAME OBJECT, not merely an equal one, and
+/// <c>MetadataConcurrencyTests.ResolverCachesAreConsistentUnderConcurrentReaders</c> tries to
+/// break that with eight threads released from a barrier. That is deliberate: the values here
+/// are pure functions of the blob, so equality could never have distinguished a guarded cache
+/// from an unguarded one, and a test asserting equality would have passed with every lock
+/// removed. Reference identity is the one consequence of the locking that a caller can observe.
+/// Four of the six lock sites are falsifiable that way and were each confirmed by removal. The
+/// other two — the cache-hit check at the top of <see cref="GetFields"/> and of
+/// <see cref="GetFieldNames"/> — guard only against reading a dictionary mid-mutation, which has
+/// no API-visible consequence; that hazard is real but untested, and the test file says so.
+/// </para>
+/// <para>
 /// <b>THE TABLES ARE HOSTILE INPUT.</b> <see cref="MetadataBlobValidator"/> is structural only:
 /// it proves the streams lie inside the blob and stops there. It never inspects a single table
 /// row, so every row index, every heap handle, and the entire <c>NestedClass</c> graph reaching
@@ -226,7 +242,18 @@ public sealed class TypeResolver
             return [];
         }
 
-        lock (_gate) _fieldCache[handle] = fields;
+        lock (_gate)
+        {
+            // Publish under the lock, but let an EARLIER publisher win. Two callers can both
+            // miss the check above and both build; assigning unconditionally left the loser
+            // holding an array no other caller will ever see, so "write-once per key" was not
+            // true in exactly the concurrent case the lock exists for — and, worse, was not
+            // observable, since both callers' answers were still equal. Returning the stored
+            // instance makes reference identity a property a test can try to violate (§13.11).
+            if (_fieldCache.TryGetValue(handle, out MetadataField[]? published)) return published;
+            _fieldCache[handle] = fields;
+        }
+
         return fields;
     }
 
@@ -243,7 +270,13 @@ public sealed class TypeResolver
         var names = new string[fields.Count];
         for (int i = 0; i < fields.Count; i++) names[i] = fields[i].Name;
 
-        lock (_gate) _fieldNameCache[handle] = names;
+        lock (_gate)
+        {
+            // As GetFields: first publisher wins, and everyone gets that instance.
+            if (_fieldNameCache.TryGetValue(handle, out string[]? published)) return published;
+            _fieldNameCache[handle] = names;
+        }
+
         return names;
     }
 

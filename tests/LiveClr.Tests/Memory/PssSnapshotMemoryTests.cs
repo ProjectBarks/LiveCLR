@@ -33,13 +33,8 @@ public class PssSnapshotMemoryTests
         {
             ulong address = (ulong)pinned.AddrOfPinnedObject();
 
-            if (!PssSnapshotMemory.TryCapture(Environment.ProcessId, out var snapshot))
-            {
-                var refusal = Assert.Throws<NotSupportedException>(() => PssSnapshotMemory.Capture(Environment.ProcessId));
-                Assert.Contains("PssCaptureSnapshot", refusal.Message);
-                Assert.IsType<Win32Exception>(refusal.InnerException);
-                return;
-            }
+            PssSnapshotMemory? snapshot = CaptureOrAssertRefusal(Environment.ProcessId);
+            if (snapshot is null) return;
 
             using (snapshot)
             {
@@ -72,6 +67,36 @@ public class PssSnapshotMemoryTests
     }
 
     /// <summary>
+    /// Capture, or — when VA cloning is genuinely unavailable in this environment — assert
+    /// that the refusal is the documented one and return null.
+    /// </summary>
+    /// <remarks>
+    /// <b>There is no silent branch.</b> Every test below used to open with
+    /// <c>if (!TryCapture(...)) return;</c>, which reports green having checked nothing:
+    /// forcing <c>TryCapture</c> to refuse unconditionally left four of five tests passing,
+    /// and they guard a bug this class's own remarks say already shipped once. §13.11's rule
+    /// is that a check whose output is constant across every input may not be measuring, and
+    /// a skip that cannot be told apart from a pass is the same failure wearing a different
+    /// hat. So the unavailable case asserts on the refusal — <c>Capture</c> must throw
+    /// <see cref="NotSupportedException"/> naming the PSS call that declined — which means a
+    /// refusal that is not genuine fails here instead of being waved through.
+    /// <para>
+    /// xunit 2.x has no runtime <c>Assert.Skip</c>; asserting the refusal is both the stronger
+    /// option and the one already used by
+    /// <see cref="A_captured_snapshot_reads_the_same_bytes_as_the_live_process"/>.
+    /// </para>
+    /// </remarks>
+    private static PssSnapshotMemory? CaptureOrAssertRefusal(int processId)
+    {
+        if (PssSnapshotMemory.TryCapture(processId, out PssSnapshotMemory? snapshot)) return snapshot;
+
+        var refusal = Assert.Throws<NotSupportedException>(() => PssSnapshotMemory.Capture(processId));
+        Assert.Contains("Pss", refusal.Message, StringComparison.Ordinal);
+        Assert.IsType<Win32Exception>(refusal.InnerException);
+        return null;
+    }
+
+    /// <summary>
     /// The regression test for the <c>PssFreeSnapshot</c> handle bug.
     /// </summary>
     /// <remarks>
@@ -86,7 +111,8 @@ public class PssSnapshotMemoryTests
     {
         using var child = ChildProcess.StartIdle();
 
-        if (!PssSnapshotMemory.TryCapture(child.Id, out var snapshot)) return;
+        PssSnapshotMemory? snapshot = CaptureOrAssertRefusal(child.Id);
+        if (snapshot is null) return;
 
         int clonePid;
         using (snapshot)
@@ -112,15 +138,24 @@ public class PssSnapshotMemoryTests
         using var child = ChildProcess.StartIdle();
         var clonePids = new List<int>();
 
+        // Availability is decided ONCE, before the loop. The refusal check used to be inside
+        // it, where a failure on iteration 3 abandoned the leak check for three clones that
+        // had already been created — and reported success (§13.11). Every later iteration
+        // uses the throwing form, so a mid-loop failure is a failure.
+        PssSnapshotMemory? first = CaptureOrAssertRefusal(child.Id);
+        if (first is null) return;
+
         for (int i = 0; i < 6; i++)
         {
-            if (!PssSnapshotMemory.TryCapture(child.Id, out var snapshot)) return;
+            PssSnapshotMemory snapshot = i == 0 ? first : PssSnapshotMemory.Capture(child.Id);
             using (snapshot)
             {
                 clonePids.Add(snapshot.CloneProcessId);
             }
             Assert.True(snapshot.ReleasedCleanly);
         }
+
+        Assert.Equal(6, clonePids.Count);
 
         var leaked = clonePids.Where(pid => !ChildProcess.WaitUntilGone(pid)).ToArray();
         Assert.True(leaked.Length == 0, $"leaked {leaked.Length} of {clonePids.Count} VA clones: {string.Join(", ", leaked)}");
@@ -136,7 +171,8 @@ public class PssSnapshotMemoryTests
     {
         using var child = ChildProcess.StartIdle();
 
-        if (!PssSnapshotMemory.TryCapture(child.Id, out var snapshot)) return;
+        PssSnapshotMemory? snapshot = CaptureOrAssertRefusal(child.Id);
+        if (snapshot is null) return;
 
         using (snapshot)
         {

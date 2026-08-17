@@ -72,19 +72,55 @@ public sealed class LiveSnapshotTests : IDisposable
             snapshot.Type(typeof(FixtureHolder).FullName!)!.Static(nameof(FixtureHolder.Instance))!.AsObject()!;
     }
 
+    /// <summary>
+    /// §4.7 / §6.4: the snapshot's reader is a cache, not the raw process reader, so a pointer
+    /// and its target come from the same moment.
+    /// </summary>
+    /// <remarks>
+    /// Measured as CACHING, not as identity. <c>Assert.NotSame(process.Memory, snapshot.Memory)</c>
+    /// is satisfied by the <c>CountingMemoryReader</c> that wraps every snapshot regardless, so
+    /// replacing <c>new PageCache(Memory, ...)</c> with the bare reader failed exactly one test
+    /// in the suite — and not this one (§13.11). What only a cache can do is serve the second
+    /// traversal without touching the target.
+    /// </remarks>
     [Fact]
     public void APageCacheGivesOneTraversalOneMemoryImage()
     {
-        // §4.7 / §6.4: the snapshot's reader is a cache, not the raw process reader, so a
-        // pointer and its target come from the same moment.
-        using var snapshot = (LiveSnapshot)_process.BeginSnapshot();
+        using var counting = new CountingMemory(_target.Memory);
+        using LiveProcess process = LiveProcess.Create(
+            0,
+            counting,
+            ownsMemory: false,
+            _target.Modules,
+            _target.CoreClr,
+            new LiveProcessOptions { StaticRoots = _target.StaticRoots() });
 
-        Assert.NotSame(_process.Memory, snapshot.Memory);
+        using var snapshot = (LiveSnapshot)process.BeginSnapshot();
+
+        Assert.NotSame(process.Memory, snapshot.Memory);
         Assert.Equal(SnapshotMode.LiveValidated, snapshot.Mode);
 
-        IClrObject holder = snapshot.Object(_target.HolderAddress)!;
-        Assert.Equal(SyntheticClrTarget.ListCount, holder.Field(nameof(FixtureHolder.Items))!.AsList()!.Count);
+        int start = counting.Reads;
+        Assert.Equal(SyntheticClrTarget.ListCount, Walk(snapshot));
+        int firstWalk = counting.Reads - start;
+        Assert.True(firstWalk > 0, "the first traversal must reach the target at all");
+
+        // The identical walk again, inside the SAME snapshot. Every byte it needs is already
+        // in the cache, so nothing reaches the target.
+        Assert.Equal(SyntheticClrTarget.ListCount, Walk(snapshot));
+        Assert.Equal(firstWalk, counting.Reads - start);
+
         Assert.True(snapshot.Validate().IsUsable);
+
+        // A NEW snapshot gets a new cache, because §8.8 puts the cache in the snapshot tier: a
+        // long-lived one keeps serving a moment that has passed without being able to tell.
+        using var second = (LiveSnapshot)process.BeginSnapshot();
+        int beforeSecond = counting.Reads;
+        Assert.Equal(SyntheticClrTarget.ListCount, Walk(second));
+        Assert.True(counting.Reads > beforeSecond, "a fresh snapshot must re-read rather than inherit a cache");
+
+        int Walk(ISnapshot s) =>
+            s.Object(_target.HolderAddress)!.Field(nameof(FixtureHolder.Items))!.AsList()!.Count;
     }
 
     [Fact]

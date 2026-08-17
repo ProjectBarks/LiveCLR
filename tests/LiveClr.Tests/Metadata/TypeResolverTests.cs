@@ -138,8 +138,20 @@ public sealed class TypeResolverTests : IDisposable
     public void EnumeratesEveryTypeInTheModule()
     {
         List<string> names = [.. Types.EnumerateTypeNames()];
+
+        // Count against TypeCount is the enumeration measured against the collection it
+        // enumerates: both are TypeDefinitions.Count, so it agrees however many rows the walk
+        // drops (§13.11). What can disagree is the SHAPE of what comes out — one name per row,
+        // every one readable, and the nesting, namespace and generic-arity spellings all
+        // reconstructed rather than left as raw #Strings entries.
         Assert.Equal(Types.TypeCount, names.Count);
-        Assert.Contains("LiveClr.Tests.Metadata.SampleType+Nested", names);
+        Assert.DoesNotContain(TypeResolver.UnreadableName, names);
+        Assert.All(names, n => Assert.False(string.IsNullOrWhiteSpace(n)));
+
+        Assert.Contains("LiveClr.Tests.Metadata.SampleType", names);           // namespaced root
+        Assert.Contains("LiveClr.Tests.Metadata.SampleType+Nested", names);    // reconstructed nesting
+        Assert.Contains("LiveClr.Tests.Metadata.SampleList", names);           // generic base
+        Assert.Contains("<Module>", names);                                    // row 1, no namespace
     }
 
     public void Dispose()

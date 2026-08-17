@@ -155,13 +155,24 @@ public sealed class DegradationTests
         ulong methodTable = target.DerivedMethodTable;
         Assert.True(process.TypeSystem.TryResolveEEClass(target.Memory, methodTable, out ulong eeClass, out _));
 
+        // Offsets from the FIXTURE, not from process.Layouts. Asking production where it reads
+        // and then unmapping exactly that address damages whatever offset production is using,
+        // including a wrong one — the test then passes for any layout at all and proves only
+        // that the reader is self-consistent (§13.11 species 3, and the doctrine
+        // SyntheticClrTarget states at the top of its own constant block). These are the
+        // addresses the fixture WROTE, so a layout that drifts fails here.
         (ulong address, int length) = field switch
         {
-            "MethodTable.BaseSize" => (methodTable + (ulong)process.Layouts.MethodTableBaseSizeOffset, 4),
-            "MethodTable.ParentMethodTable" => (methodTable + (ulong)process.Layouts.MethodTableParentOffset, 8),
-            "EEClass.InternalCorElementType" => (eeClass + (ulong)process.Layouts.EEClassElementTypeOffset, 1),
+            "MethodTable.BaseSize" => (methodTable + SyntheticClrTarget.WrittenAt.MethodTableBaseSize, 4),
+            "MethodTable.ParentMethodTable" => (methodTable + SyntheticClrTarget.WrittenAt.MethodTableParent, 8),
+            "EEClass.InternalCorElementType" => (eeClass + SyntheticClrTarget.WrittenAt.EEClassInternalCorElementType, 1),
             _ => throw new InvalidOperationException(field),
         };
+
+        // And the two agree today, so the change above is a change of SOURCE, not of address.
+        Assert.Equal(SyntheticClrTarget.WrittenAt.MethodTableBaseSize, process.Layouts.MethodTableBaseSizeOffset);
+        Assert.Equal(SyntheticClrTarget.WrittenAt.MethodTableParent, process.Layouts.MethodTableParentOffset);
+        Assert.Equal(SyntheticClrTarget.WrittenAt.EEClassInternalCorElementType, process.Layouts.EEClassElementTypeOffset);
 
         var torn = new MutableMemoryOverlay(target.Memory);
         torn.Unreadable(address, length);
@@ -177,18 +188,87 @@ public sealed class DegradationTests
         Assert.NotEqual(0UL, type.ParentMethodTable);
     }
 
-    [Theory]
-    [InlineData("too few samples", 2, false, false)]
-    [InlineData("one offset disagrees", int.MaxValue, true, false)]
-    [InlineData("the anchor is not a method table", int.MaxValue, false, true)]
-    public void ADegenerateCalibrationAnchorEndsInRefusalNotAConfidentGuess(
-        string because, int fieldLimit, bool corruptOne, bool garbageAnchor)
+    /// <summary>
+    /// An array header whose element count no allocation could hold is refused, not walked.
+    /// </summary>
+    /// <remarks>
+    /// <c>m_NumComponents</c> is a decoded number and so is the field offset that reaches it, so
+    /// a wrong FieldDesc width or a torn header produces an ENORMOUS count rather than an
+    /// obviously invalid one. The only bound was <c>&gt; int.MaxValue</c>, which a billion passes
+    /// comfortably — and a consumer that then walks the array spins instead of failing. §12.5's
+    /// rule is that a bad decode must fail fast, and the evidence that it is bad is available
+    /// for one read: the slot that many elements in is not mapped.
+    /// </remarks>
+    [Fact]
+    public void AnArrayCountNoAllocationCouldHoldIsRefusedRatherThanWalked()
     {
-        // §12.5's lesson, restated: the worst outcome is a single confident wrong answer. Each
-        // of these damages the anchor differently, and all three must land on "no encoding".
+        using SyntheticClrTarget target = SyntheticClrTarget.Build();
+
+        ulong numbersAddress;
+        using (LiveProcess clean = target.Attach())
+        using (ISnapshot before = clean.BeginSnapshot())
+        {
+            var numbers = (ClrArray)before.Object(target.HolderAddress)!
+                .Field(nameof(FixtureHolder.Numbers))!.AsArray()!;
+
+            numbersAddress = numbers.Address;
+            Assert.Equal(3, numbers.Count);
+        }
+
+        // The same array, with only its component count changed — every other byte, and every
+        // offset used to reach it, is exactly as the passing case above.
+        var torn = new MutableMemoryOverlay(target.Memory);
+        torn.WriteI32(numbersAddress + 8, 1_000_000_000);
+
+        using LiveProcess process = LiveProcess.Create(
+            0, torn, ownsMemory: false, target.Modules, target.CoreClr);
+        using ISnapshot snapshot = process.BeginSnapshot();
+
+        var wild = (ClrArray)snapshot.Object(target.HolderAddress)!
+            .Field(nameof(FixtureHolder.Numbers))!.AsArray()!;
+
+        // The claim survives for diagnostics; nothing acts on it.
+        Assert.Equal(1_000_000_000, wild.ReportedCount);
+        Assert.Equal(0, wild.Count);
+        Assert.True(wild[0].IsNull);
+
+        SnapshotHealth health = snapshot.Validate();
+        Assert.True(health.StructuralAnomalies > 0);
+        Assert.Contains("bad decode", health.Detail, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// §12.5's lesson, restated: the worst outcome is a single confident wrong answer. Each row
+    /// damages the anchor differently, and each must land on "no encoding" FOR ITS OWN REASON.
+    /// </summary>
+    /// <remarks>
+    /// The reason is asserted, not just the refusal. Three rows that all check
+    /// <c>IsCalibrated == false</c> are three copies of one test, and the "too few samples" row
+    /// was not even reaching the clause it names: <c>ExceptionFieldLimit</c> controls how many
+    /// FieldDescs the FIXTURE lays down, while the sample count comes from how many offsets the
+    /// DESCRIPTOR publishes — so the blob still published all eight and the refusal came from a
+    /// later clause with a different message (§13.11). Starving the published blob with
+    /// <c>OmitDescriptorEntries</c> is what actually reaches it.
+    /// </remarks>
+    [Theory]
+    [InlineData("too few samples", 6, false, false, "needed to pin a bitfield position")]
+    [InlineData("one offset disagrees", 0, true, false, "reproduces the published")]
+    [InlineData("the anchor is not a method table", 0, false, true, "could not reach CoreLib's Module.Base")]
+    public void ADegenerateCalibrationAnchorEndsInRefusalNotAConfidentGuess(
+        string because, int omitCount, bool corruptOne, bool garbageAnchor, string expectedReason)
+    {
+        // The eight Exception fields §5.2 publishes, least-load-bearing first; omitting six of
+        // them leaves two, below the three a bitfield position needs.
+        string[] published =
+        [
+            "Exception._watsonBuckets", "Exception._stackTraceString", "Exception._remoteStackTraceString",
+            "Exception._xcode", "Exception._HResult", "Exception._stackTrace",
+            "Exception._innerException", "Exception._message",
+        ];
+
         using SyntheticClrTarget target = SyntheticClrTarget.Build(new SyntheticTargetOptions
         {
-            ExceptionFieldLimit = fieldLimit,
+            OmitDescriptorEntries = published[..omitCount],
             CorruptOneExceptionOffset = corruptOne,
             GarbageExceptionMethodTable = garbageAnchor,
         });
@@ -199,6 +279,10 @@ public sealed class DegradationTests
         Assert.False(calibration.IsCalibrated, $"{because}: {calibration.Detail}");
         Assert.Null(calibration.Encoding);
         Assert.NotEqual(1, calibration.CandidateCount);
+
+        // Each row reaches the clause it is named after, rather than some other refusal that
+        // happens to produce the same verdict.
+        Assert.Contains(expectedReason, calibration.Detail, StringComparison.Ordinal);
 
         // And nothing downstream invents an offset to compensate.
         using ISnapshot snapshot = process.BeginSnapshot();

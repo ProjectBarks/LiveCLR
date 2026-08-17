@@ -344,8 +344,13 @@ public class PageCacheTests
 
         Assert.False(cache.TryRead(0x9000, new byte[4]));
 
+        // The number the READER reported, not whatever the cache is currently holding:
+        // comparing ex.NativeErrorCode to cache.LastNativeErrorCode is the same value on both
+        // sides of the assertion and agrees however the code is propagated (§13.11).
         var ex = cache.ReadFailure(0x9000, 4);
-        Assert.Equal(cache.LastNativeErrorCode, ex.NativeErrorCode);
+        Assert.Equal(998, inner.FailureErrorCode);          // ERROR_NOACCESS, what the fake reports
+        Assert.Equal(998, ex.NativeErrorCode);
+        Assert.Equal(998, cache.LastNativeErrorCode);
         Assert.True(IsTransientRead(ex.Message));
     }
 

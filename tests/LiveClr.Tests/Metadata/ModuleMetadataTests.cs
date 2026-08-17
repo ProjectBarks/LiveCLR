@@ -47,11 +47,17 @@ public sealed class ModuleMetadataTests
         Assert.True(metadata.Root.HasStream("#GUID"));
         Assert.True(metadata.Root.HasStream("#Blob"));
 
-        foreach (MetadataStreamHeader stream in metadata.Root.Streams)
-        {
-            Assert.InRange(stream.Offset, 0, metadata.MetadataSize);
-            Assert.InRange(stream.Offset + stream.Size, 0, metadata.MetadataSize);
-        }
+        // NOT "every stream lies inside the blob": TryLoad refuses a blob for which that is
+        // false, so by the time there is a ModuleMetadata to ask, the answer is fixed and the
+        // loop cannot come out any way but true (§13.11). That property is falsifiable one
+        // layer down, where a blob can be built that violates it — see
+        // MetadataBlobValidatorTests. What is worth asserting here is what the loader does NOT
+        // guarantee: that the stream table is a set of distinct, non-empty streams rather than
+        // whatever repeated or zero-length entries a header happens to list.
+        MetadataStreamHeader[] streams = [.. metadata.Root.Streams];
+        Assert.True(streams.Length >= 4, $"only {streams.Length} streams");
+        Assert.Equal(streams.Length, streams.Select(s => s.Name).Distinct(StringComparer.Ordinal).Count());
+        Assert.All(streams, s => Assert.True(s.Size > 0, $"{s.Name} is empty"));
     }
 
     [Fact]

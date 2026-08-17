@@ -2,6 +2,7 @@ namespace LiveClr.Tests.Metadata;
 
 using System.Collections.Concurrent;
 using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
 using LiveClr.Metadata;
 
 /// <summary>
@@ -37,6 +38,39 @@ public sealed class MetadataConcurrencyTests
         Assert.Single(results.Distinct());
     }
 
+    /// <summary>
+    /// Eight threads released simultaneously onto a cold resolver, asserting on the identity of
+    /// what they get back rather than on its value.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Reference equality is the whole point.</b> This test used to collect
+    /// <c>GetFullName(handle)</c> and <c>GetFieldNames(handle).Count</c> and assert one distinct
+    /// value of each. Both are pure functions of the metadata blob, so both agree whatever the
+    /// caches do: replacing all six <c>lock (_gate)</c> statements with <c>if (true)</c> left
+    /// the whole suite green (§13.11). Identity does not agree — an unguarded cache lets two
+    /// racing callers each publish and return their own instance — so that is what is asserted.
+    /// </para>
+    /// <para>
+    /// <b>A Barrier, not Parallel.For.</b> Contention here is one dictionary key deep and lives
+    /// entirely in the first microsecond of the first touch. Threads that trickle in find the
+    /// cache warm and race with nobody, which is the other half of why the old test could not
+    /// fail. The barrier makes the first touch genuinely simultaneous.
+    /// </para>
+    /// <para>
+    /// <b>Exactly what is covered, stated rather than implied.</b> <see cref="TypeResolver"/>
+    /// takes <c>_gate</c> in six places. Four of them are falsifiable through this API and each
+    /// was confirmed by removing it individually: <c>TryResolveType</c>, <c>GetFullName</c>, and
+    /// the publishing lock in each of <c>GetFields</c> and <c>GetFieldNames</c> (the last three
+    /// via the two sweep tests below). The remaining two — the cache-hit CHECK at the top of
+    /// <c>GetFields</c> and of <c>GetFieldNames</c> — guard only against reading a dictionary
+    /// while another thread mutates it. Removing either leaves this whole suite green, because a
+    /// racing reader that misses simply builds a value and then loses the publish race, which is
+    /// indistinguishable from having lost it anyway. Their real hazard, a structurally corrupted
+    /// <c>Dictionary</c>, surfaces as a throw or a spin and cannot be made deterministic, so
+    /// nothing automated tries to violate it and no coverage is claimed for it.
+    /// </para>
+    /// </remarks>
     [Fact]
     public void ResolverCachesAreConsistentUnderConcurrentReaders()
     {
@@ -48,9 +82,10 @@ public sealed class MetadataConcurrencyTests
         // Every thread races on the SAME first-touch: index build, name cache, field caches.
         var resolvers = new ConcurrentBag<TypeResolver>();
         var names = new ConcurrentBag<string>();
-        var fieldCounts = new ConcurrentBag<int>();
+        var fieldNameLists = new ConcurrentBag<IReadOnlyList<string>>();
+        var fieldLists = new ConcurrentBag<IReadOnlyList<MetadataField>>();
 
-        Parallel.For(0, Threads, _ =>
+        RaceFromABarrier(() =>
         {
             for (int i = 0; i < Iterations; i++)
             {
@@ -59,14 +94,20 @@ public sealed class MetadataConcurrencyTests
 
                 Assert.True(types.TryResolveType("LiveClr.Metadata.ModuleMetadata", out var handle));
                 names.Add(types.GetFullName(handle));
-                fieldCounts.Add(types.GetFieldNames(handle).Count);
+                fieldNameLists.Add(types.GetFieldNames(handle));
+                fieldLists.Add(types.GetFields(handle));
             }
         });
 
+        Assert.Equal(Threads * Iterations, fieldNameLists.Count);
+
         // Lazy<T> with ExecutionAndPublication: exactly one resolver, so exactly one index.
         Assert.Single(resolvers.Distinct());
-        Assert.Single(names.Distinct());
-        Assert.Single(fieldCounts.Distinct());
+
+        // One published instance per key, handed to everyone — not one value per key.
+        AssertOneInstance(names);
+        AssertOneInstance(fieldNameLists);
+        AssertOneInstance(fieldLists);
     }
 
     [Fact]
@@ -86,6 +127,149 @@ public sealed class MetadataConcurrencyTests
         // (API fact 1) makes repeated field-name lookup the hot path.
         Assert.Same(first, second);
         Assert.Same(metadata.Types.GetFields(handle), metadata.Types.GetFields(handle));
+    }
+
+    /// <summary>
+    /// The field caches, swept across every type in the module with all eight threads
+    /// rendezvousing before each one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="ResolverCachesAreConsistentUnderConcurrentReaders"/> races on ONE cold key, and
+    /// on a cold resolver the index build inside <c>TryResolveType</c> holds the gate long enough
+    /// to serialise everyone behind it. So it only reddens when every lock is removed at once and
+    /// cannot say which one mattered — and a single key gives the race exactly one chance, which
+    /// a fast path like <c>GetFields</c> wins outright more often than not.
+    /// </para>
+    /// <para>
+    /// Sweeping every type gives the race hundreds of chances, and the per-key rendezvous makes
+    /// each of them a genuine simultaneous first touch rather than a hope about scheduling. The
+    /// handles come from the raw reader, so no index build is involved and the two publish locks
+    /// are the only thing standing between this and two callers holding different arrays.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void FieldCachesPublishOneInstanceToEveryConcurrentCaller()
+    {
+        MappedPeImage mapped = MappedPeImage.FromFile(typeof(ModuleMetadata).Assembly.Location);
+        using var reader = mapped.CreateReader();
+        using ModuleMetadata? metadata = ModuleMetadata.TryLoad(reader, MappedPeImage.BaseAddress);
+        Assert.NotNull(metadata);
+
+        TypeResolver types = metadata.Types;
+        TypeDefinitionHandle[] handles = [.. types.Reader.TypeDefinitions];
+        Assert.True(handles.Length > 20, $"only {handles.Length} cold keys to race over");
+
+        var fields = new ConcurrentDictionary<TypeDefinitionHandle, ConcurrentBag<object>>();
+        var fieldNames = new ConcurrentDictionary<TypeDefinitionHandle, ConcurrentBag<object>>();
+
+        RaceOverKeys(handles, handle =>
+        {
+            fields.GetOrAdd(handle, _ => []).Add(types.GetFields(handle));
+            fieldNames.GetOrAdd(handle, _ => []).Add(types.GetFieldNames(handle));
+        });
+
+        AssertOneInstancePerKey(fields, handles.Length);
+        AssertOneInstancePerKey(fieldNames, handles.Length);
+    }
+
+    /// <summary>
+    /// The name cache, swept the same way. Handles come from the raw reader because going through
+    /// <c>TryResolveType</c> would populate <c>_nameCache</c> for every type in the module as a
+    /// side effect of building the index, after which <c>GetFullName</c> can only ever hit the
+    /// cache and its lock becomes unfalsifiable.
+    /// </summary>
+    [Fact]
+    public void FullNamesPublishOneInstanceToEveryConcurrentCaller()
+    {
+        MappedPeImage mapped = MappedPeImage.FromFile(typeof(ModuleMetadata).Assembly.Location);
+        using var reader = mapped.CreateReader();
+        using ModuleMetadata? metadata = ModuleMetadata.TryLoad(reader, MappedPeImage.BaseAddress);
+        Assert.NotNull(metadata);
+
+        TypeResolver types = metadata.Types;
+        TypeDefinitionHandle[] handles = [.. types.Reader.TypeDefinitions];
+        var names = new ConcurrentDictionary<TypeDefinitionHandle, ConcurrentBag<object>>();
+
+        RaceOverKeys(handles, handle => names.GetOrAdd(handle, _ => []).Add(types.GetFullName(handle)));
+
+        AssertOneInstancePerKey(names, handles.Length);
+    }
+
+    private static void AssertOneInstancePerKey<TKey>(
+        ConcurrentDictionary<TKey, ConcurrentBag<object>> observed, int expectedKeys)
+        where TKey : notnull
+    {
+        Assert.Equal(expectedKeys, observed.Count);
+
+        foreach ((TKey key, ConcurrentBag<object> instances) in observed)
+        {
+            Assert.Equal(Threads, instances.Count);
+            Assert.Single(instances.Distinct(ReferenceEqualityComparer.Instance));
+            Assert.NotNull(key);
+        }
+    }
+
+    private static void AssertOneInstance<T>(IEnumerable<T> observed) where T : class =>
+        Assert.Single(observed.Cast<object>().Distinct(ReferenceEqualityComparer.Instance));
+
+    /// <summary>
+    /// Run <paramref name="body"/> on <see cref="Threads"/> real threads that all leave the
+    /// starting line together.
+    /// </summary>
+    /// <remarks>
+    /// Real threads rather than <c>Parallel.For</c>: the barrier needs exactly
+    /// <see cref="Threads"/> participants, and the thread pool is free to supply fewer.
+    /// </remarks>
+    private static void RaceFromABarrier(Action body) => Race(rendezvous =>
+    {
+        rendezvous();
+        body();
+    });
+
+    /// <summary>
+    /// Same, but with every thread re-synchronising immediately before each key, so each key gets
+    /// a genuine simultaneous first touch instead of one hope about scheduling.
+    /// </summary>
+    private static void RaceOverKeys<T>(IReadOnlyList<T> keys, Action<T> body) => Race(rendezvous =>
+    {
+        foreach (T key in keys)
+        {
+            rendezvous();
+            body(key);
+        }
+    });
+
+    private static void Race(Action<Action> body)
+    {
+        using var startLine = new Barrier(Threads);
+        var failures = new ConcurrentBag<Exception>();
+        var threads = new Thread[Threads];
+
+        // A bounded wait, not an unbounded one. If a thread dies mid-sweep — which is exactly
+        // what an unguarded cache can do — the survivors must fall through and let the test
+        // report the exception, not deadlock and take the run with them.
+        void Rendezvous() => startLine.SignalAndWait(TimeSpan.FromSeconds(5));
+
+        for (int t = 0; t < Threads; t++)
+        {
+            threads[t] = new Thread(() =>
+            {
+                try
+                {
+                    body(Rendezvous);
+                }
+                catch (Exception e)
+                {
+                    failures.Add(e);
+                }
+            });
+
+            threads[t].Start();
+        }
+
+        foreach (Thread thread in threads) thread.Join();
+        Assert.Empty(failures);
     }
 
     [Fact]

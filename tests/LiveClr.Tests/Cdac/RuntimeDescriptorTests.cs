@@ -61,17 +61,33 @@ public class RuntimeDescriptorTests
         Assert.Equal(0UL, d.PointerData[0]);                                  // index 0 unused
     }
 
-    [Fact]
-    public void TryRead_RejectsAWrongMagic()
+    /// <summary>
+    /// Reading 40 bytes at the wrong address yields plausible garbage rather than an error,
+    /// so the magic is the only thing standing between us and a confident misparse.
+    /// </summary>
+    /// <remarks>
+    /// The target is complete and readable in every other respect — the same
+    /// <see cref="SyntheticDescriptor.BuildTarget"/> the parsing tests use — so the magic is
+    /// the ONLY thing that can refuse it. An earlier version mapped the 40-byte header alone;
+    /// <c>jsonAddress</c> then pointed at unmapped memory and <c>TryRead</c> refused thirty
+    /// lines later at the blob read, which meant deleting the magic check left this test
+    /// green. §13.11's species: the check refused, but not for the reason under test.
+    /// </remarks>
+    [Theory]
+    [InlineData("DNCCDA?")]   // one byte of the eight
+    [InlineData("dnccdac")]   // right letters, wrong case
+    [InlineData("CADCCND")]   // §5.1: a big-endian target stores it reversed
+    public void TryRead_RejectsAWrongMagic(string magic)
     {
-        // Reading 40 bytes at the wrong address yields plausible garbage rather than an
-        // error, so the magic is the only thing standing between us and a confident
-        // misparse.
-        byte[] header = SyntheticDescriptor.Header64(10, magic: "DNCCDA?");
-        using var memory = new FakeMemory().Map(SyntheticDescriptor.DescriptorAddress, header);
+        using FakeMemory memory = SyntheticDescriptor.BuildTarget(magic: magic);
 
         Assert.False(RuntimeDescriptor.TryRead(memory, SyntheticDescriptor.DescriptorAddress, out RuntimeDescriptor? d));
         Assert.Null(d);
+
+        // The control, in the same test: the identical target with the magic intact parses.
+        // Without this the refusal above could still be coming from somewhere else.
+        using FakeMemory intact = SyntheticDescriptor.BuildTarget();
+        Assert.True(RuntimeDescriptor.TryRead(intact, SyntheticDescriptor.DescriptorAddress, out _));
     }
 
     [Fact]
@@ -295,6 +311,56 @@ public class RuntimeDescriptorTests
         Assert.False(d.Globals.ContainsKey("Weird"));
         Assert.Equal(1, d.Contracts["Loader"]);
         Assert.False(d.Contracts.ContainsKey("Weird"));
+    }
+
+    /// <summary>
+    /// The header fields the parser reads rather than assumes: format version, baseline, and
+    /// per-contract versions.
+    /// </summary>
+    /// <remarks>
+    /// Every blob in this suite is the shipped §5.2 one — version 0, baseline "empty", every
+    /// contract at version 1 — and those are ALSO the fallbacks this parser uses when a field is
+    /// missing or malformed. So the three were indistinguishable from constants: hardcoding
+    /// <c>version = 0</c>, <c>baseline = "empty"</c> and <c>contracts[name] = 1</c> left the
+    /// whole suite green (§13.11). The descriptor is an explicitly versioned format the runtime
+    /// is expected to extend, and a later baseline is the ordinary forward case, not a hostile
+    /// one.
+    /// </remarks>
+    [Fact]
+    public void Parsing_ReadsTheVersionBaselineAndContractVersionsRatherThanAssumingThem()
+    {
+        const string blob = """
+            {
+              "version": 1,
+              "baseline": "generic_baseline",
+              "contracts": { "Loader": 1, "Object": 2, "Thread": 7 }
+            }
+            """;
+
+        Assert.True(RuntimeDescriptor.TryParse(blob, null, out RuntimeDescriptor? d));
+
+        Assert.Equal(1, d.Version);
+        Assert.Equal("generic_baseline", d.Baseline);
+        Assert.Equal(1, d.Contracts["Loader"]);
+        Assert.Equal(2, d.Contracts["Object"]);
+        Assert.Equal(7, d.Contracts["Thread"]);
+    }
+
+    [Fact]
+    public void Parsing_FallsBackToVersionZeroAndAnEmptyBaselineOnlyWhenTheyAreAbsent()
+    {
+        // The other half of the pair above: the defaults are what a descriptor that publishes
+        // neither gets, not what every descriptor gets.
+        Assert.True(RuntimeDescriptor.TryParse("""{"types":{}}""", null, out RuntimeDescriptor? d));
+
+        Assert.Equal(0, d.Version);
+        Assert.Equal("empty", d.Baseline);
+
+        // A wrong-shaped value is also a fallback, not a parse failure — §5's forward
+        // compatibility argument applies to the header fields too.
+        Assert.True(RuntimeDescriptor.TryParse("""{"version":"1","baseline":7}""", null, out RuntimeDescriptor? odd));
+        Assert.Equal(0, odd.Version);
+        Assert.Equal("empty", odd.Baseline);
     }
 
     [Fact]

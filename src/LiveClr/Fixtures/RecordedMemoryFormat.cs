@@ -149,8 +149,16 @@ internal static class RecordedMemoryFormat
             havePrevious = true;
         }
 
-        // With a canonical table nothing can coalesce, so these three agree or the header lied.
-        if (seen != totalBytes || map.TotalBytes != totalBytes || map.Count != regionCount)
+        // With a canonical table nothing can coalesce, so ONE comparison is the whole check.
+        // This used to test three: `map.TotalBytes != totalBytes` and `map.Count != regionCount`
+        // as well. Both are unreachable, and provably so — the canonical-order guard above
+        // rejects any address that overlaps or abuts its predecessor, which is the only way
+        // RegionMap.Add merges, so after the loop map.Count == regionCount and
+        // map.TotalBytes == seen identically. Two clauses that cannot come out any way but
+        // false are §13.11's family, and leaving them in implies a coverage that does not
+        // exist. The reachable disagreement is a header count or byte total that does not
+        // match the table behind it.
+        if (seen != totalBytes)
             throw new InvalidDataException(
                 $"Fixture header disagrees with its contents: header says {regionCount} region(s)/" +
                 $"{totalBytes} byte(s), contents give {map.Count}/{map.TotalBytes}.");

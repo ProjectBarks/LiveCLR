@@ -175,15 +175,37 @@ public sealed class PeImage
     }
 
     /// <summary>
-    /// Every export name, in table order. Diagnostics only — §12.1's "12 names" line is
-    /// the cheapest confirmation that the export walk landed on a real table.
+    /// Every export name this image could be read for, in table order.
     /// </summary>
-    public IReadOnlyList<string> GetExportNames()
+    /// <remarks>
+    /// <b>The list can be SHORTER than the table declares</b>, because an entry whose name RVA
+    /// leaves the image, or whose string cannot be read, is skipped rather than invented. Use
+    /// <see cref="GetExportNames(out int)"/> when the count matters: §12.1's "12 names" line is
+    /// only confirmation that the walk landed on a real table if the two agree, and this
+    /// overload cannot tell you whether they do. That is exactly how it went wrong — the doc
+    /// here sold <c>Count</c> as that confirmation while the loop shrank it without counting,
+    /// so a module that dropped one name looked like a module that exports one thing fewer
+    /// (§13.11).
+    /// </remarks>
+    public IReadOnlyList<string> GetExportNames() => GetExportNames(out _);
+
+    /// <summary>
+    /// Every export name that could be read, together with the number the export directory
+    /// DECLARED. They differ when an entry was unreadable; equality is the confirmation.
+    /// </summary>
+    /// <param name="declaredCount">
+    /// <c>NumberOfNames</c> from <c>IMAGE_EXPORT_DIRECTORY</c>, or 0 when no export table could
+    /// be read at all — in which case the returned list is empty too, and the two still agree.
+    /// </param>
+    public IReadOnlyList<string> GetExportNames(out int declaredCount)
     {
+        declaredCount = 0;
         if (!TryReadExportTable(out ExportTable table)) return [];
         if (!TryReadNameTables(table, out byte[]? nameRvas, out _)) return [];
 
-        var names = new List<string>((int)table.NameCount);
+        declaredCount = (int)table.NameCount;
+
+        var names = new List<string>(declaredCount);
         for (int i = 0; i < table.NameCount; i++)
         {
             uint nameRva = BinaryPrimitives.ReadUInt32LittleEndian(nameRvas.AsSpan(i * 4));

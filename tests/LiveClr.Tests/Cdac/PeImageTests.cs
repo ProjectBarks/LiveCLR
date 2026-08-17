@@ -123,10 +123,43 @@ public class PeImageTests
         using FakeMemory memory = MapImage(SyntheticPe.BuildCoreClrLike());
         Assert.True(PeImage.TryLoad(memory, SyntheticPe.DefaultImageBase, out PeImage? image));
 
-        IReadOnlyList<string> names = image.GetExportNames();
+        IReadOnlyList<string> names = image.GetExportNames(out int declared);
 
         Assert.Equal(12, names.Count);
+        Assert.Equal(12, declared);
         Assert.Contains(DescriptorLocator.ExportName, names);
+        Assert.Contains("g_dacTable", names);
+    }
+
+    /// <summary>
+    /// One name whose RVA leaves the image: eleven names come back, and the table still says
+    /// twelve.
+    /// </summary>
+    /// <remarks>
+    /// The list shrinks — there is no honest name to put in the gap — but it must not shrink
+    /// SILENTLY. <c>GetExportNames</c>'s own doc used to sell its length as confirmation that
+    /// the walk had landed on a real table, while the loop dropped entries without counting: a
+    /// module missing one name was then indistinguishable from a module exporting one thing
+    /// fewer. That is §13.11's species 6 — a denominator that shrinks with its numerator —
+    /// living in production code rather than in a test.
+    /// </remarks>
+    [Fact]
+    public void GetExportNames_ReportsTheDeclaredCountWhenOneNameIsUnreadable()
+    {
+        byte[] image = SyntheticPe.BuildCoreClrLike();
+        int namesRva = (int)SyntheticPe.ExportDirectoryRva + 40 + (SyntheticPe.CoreClrExports.Length * 4);
+
+        // Entry 0's name now points outside the module.
+        BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan(namesRva), 0x00FF_0000);
+        using FakeMemory memory = MapImage(image);
+
+        Assert.True(PeImage.TryLoad(memory, SyntheticPe.DefaultImageBase, out PeImage? pe));
+
+        IReadOnlyList<string> names = pe.GetExportNames(out int declared);
+
+        Assert.Equal(11, names.Count);
+        Assert.Equal(12, declared);
+        Assert.DoesNotContain("DllGetActivationFactory", names);
         Assert.Contains("g_dacTable", names);
     }
 
@@ -218,18 +251,41 @@ public class PeImageTests
         Assert.Empty(pe.GetExportNames());
     }
 
+    /// <summary>
+    /// A corrupt <c>AddressOfNames</c> pointing past the module, with a perfectly valid name
+    /// table waiting at the address it points to.
+    /// </summary>
+    /// <remarks>
+    /// The decoy is the test. Left unmapped — as this used to be — the walk fails at the read
+    /// instead of at the bounds check, so deleting the bounds check kept the suite green while
+    /// modelling the opposite of the hazard the code's own comment names: in a live process
+    /// the pages next door are usually mapped by something else, and an unchecked RVA then
+    /// returns names that look entirely real (§4.3, §13.11).
+    /// </remarks>
     [Fact]
     public void TryFindExport_ReturnsFalseWhenATableRunsOutsideTheImage()
     {
-        // A corrupt AddressOfNames pointing past the module: in a live process the pages
-        // next door are often mapped, so this must be rejected by bounds rather than by
-        // luck.
+        const uint decoyRva = 0x0F00_0000;
+
         byte[] image = SyntheticPe.BuildCoreClrLike();
-        BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan((int)SyntheticPe.ExportDirectoryRva + 32), 0x0F00_0000);
-        using FakeMemory memory = MapImage(image);
+        BinaryPrimitives.WriteUInt32LittleEndian(image.AsSpan((int)SyntheticPe.ExportDirectoryRva + 32), decoyRva);
+
+        // The neighbouring allocation: a byte-for-byte copy of the image's real name table,
+        // whose entries point back at the real string table. Nothing else about the walk is
+        // damaged, so if the RVA is not bounds-checked the lookup SUCCEEDS.
+        int namesOffset = (int)SyntheticPe.ExportDirectoryRva + 40 + (SyntheticPe.CoreClrExports.Length * 4);
+        byte[] decoy = image[namesOffset..(namesOffset + (SyntheticPe.CoreClrExports.Length * 4))];
+
+        using FakeMemory memory = MapImage(image).Map(SyntheticPe.DefaultImageBase + decoyRva, decoy);
 
         Assert.True(PeImage.TryLoad(memory, SyntheticPe.DefaultImageBase, out PeImage? pe));
         Assert.False(pe.TryFindExport(DescriptorLocator.ExportName, out _));
+        Assert.Empty(pe.GetExportNames());
+
+        // The decoy really is readable and really does spell the export name, so the refusal
+        // above is the bounds check and nothing else.
+        Assert.True(memory.TryRead(SyntheticPe.DefaultImageBase + decoyRva, new byte[decoy.Length]));
+        Assert.Equal(SyntheticPe.CoreClrExports.Length * 4, decoy.Length);
     }
 
     [Theory]
@@ -256,14 +312,37 @@ public class PeImageTests
         Assert.False(PeImage.TryLoad(memory, SyntheticPe.DefaultImageBase, out _));
     }
 
+    /// <summary>
+    /// An <c>e_lfanew</c> far outside the first page is refused by the bound, not by luck.
+    /// </summary>
+    /// <remarks>
+    /// A perfectly good copy of the NT headers is mapped AT the bogus offset, so the walk that
+    /// follows it would succeed. That is the realistic shape: §4.3 probes module bases, and a
+    /// wrong base lands in memory that is mapped by something else — reading a random address
+    /// and interpreting it is the failure the bound exists to prevent. Left unmapped, as this
+    /// test used to be, the read failed first and the bound was untested (§13.11).
+    /// </remarks>
     [Fact]
     public void TryLoad_ReturnsFalseForAnAbsurdLfanew()
     {
-        byte[] image = SyntheticPe.BuildCoreClrLike();
-        BinaryPrimitives.WriteInt32LittleEndian(image.AsSpan(0x3C), 0x0010_0000);
-        using FakeMemory memory = MapImage(image);
+        const int bogus = 0x0010_0000;
 
+        byte[] image = SyntheticPe.BuildCoreClrLike();
+        BinaryPrimitives.WriteInt32LittleEndian(image.AsSpan(0x3C), bogus);
+
+        byte[] ntHeaders = image[0x80..0x200];
+        using FakeMemory memory = MapImage(image).Map(SyntheticPe.DefaultImageBase + bogus, ntHeaders);
+
+        // The decoy is genuinely a PE signature, so nothing but the offset bound refuses it.
+        Assert.Equal(0x0000_4550u, BinaryPrimitives.ReadUInt32LittleEndian(ntHeaders));
         Assert.False(PeImage.TryLoad(memory, SyntheticPe.DefaultImageBase, out _));
+
+        // ...and the largest offset the bound permits still parses, so the rejection above is
+        // the cap rather than a blanket refusal of anything past the DOS stub.
+        byte[] atTheCap = SyntheticPe.BuildCoreClrLike();
+        BinaryPrimitives.WriteInt32LittleEndian(atTheCap.AsSpan(0x3C), 0x1000);
+        using FakeMemory capped = MapImage(atTheCap).Map(SyntheticPe.DefaultImageBase + 0x1000, atTheCap[0x80..0x200]);
+        Assert.True(PeImage.TryLoad(capped, SyntheticPe.DefaultImageBase, out _));
     }
 
     [Fact]

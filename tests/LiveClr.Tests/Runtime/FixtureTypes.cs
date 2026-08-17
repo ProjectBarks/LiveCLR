@@ -46,6 +46,18 @@ internal class FixtureDerived : FixtureBase
 
     /// <summary>Inline, not a reference — and an odd <c>m_type</c>, which is the point.</summary>
     public FixturePoint Position;
+
+    /// <summary>
+    /// Declared in metadata but deliberately given no <c>FieldDesc</c> by
+    /// <c>SyntheticClrTarget</c>, so the runtime side genuinely cannot answer for it.
+    /// </summary>
+    /// <remarks>
+    /// This exists so the §7b.2 precedence test is a contest between two sources that BOTH
+    /// have an opinion. Without a field only the profile can resolve, a suite that dropped
+    /// <c>LiveProcessOptions.FieldLayout</c> on the floor entirely would look identical to
+    /// one that honoured it and merely ranked it second.
+    /// </remarks>
+    public int ProfiledOnly;
 }
 
 /// <summary>Holds the collections, plus a static root to resolve from.</summary>

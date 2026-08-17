@@ -17,6 +17,17 @@ using LiveClr.Tests.Metadata;
 /// is indistinguishable from a hardcoded table; one that handles two unrelated bit positions
 /// and two different back-pointer forms is not. This is §12.5's own standard of evidence —
 /// intersect across samples that disagree — applied to the test rather than to the target.
+/// <para>
+/// <b>Footnote, for whoever changes these next: the width theory has ONE load-bearing row, not
+/// two.</b> <see cref="Alternate"/> packs the offset flush against the top of the word — bits
+/// [5, 32) — so there IS no bit above the offset field for a too-wide window to swallow, and
+/// its width is pinned by the word boundary whatever the calibration does. Only
+/// <see cref="CoreClrLike"/>, whose 27-bit field has <c>m_type</c> sitting above it, can detect
+/// a width bug at all. Two styles prove the position is DERIVED rather than recognised; they do
+/// not double the evidence for the width. Nothing here needs changing — this is a note about
+/// what the row is worth, so that deleting the CoreClrLike row later is understood as removing
+/// the width test entirely.
+/// </para>
 /// </remarks>
 public enum FieldDescStyle
 {
@@ -463,6 +474,23 @@ internal sealed class SyntheticClrTarget : IDisposable
 
     /// <summary>How many calibration samples the fixture actually managed to lay down.</summary>
     public int PublishedExceptionFields { get; private set; }
+
+    /// <summary>
+    /// The offsets this fixture WROTE, for tests that need to damage a specific field.
+    /// </summary>
+    /// <remarks>
+    /// The same argument as the private constants above, applied one level out. A test that
+    /// unmaps <c>methodTable + process.Layouts.MethodTableParentOffset</c> is asking production
+    /// where it reads and then damaging exactly that — so it passes whatever the offset is,
+    /// including a wrong one, and proves only that production is self-consistent. These say
+    /// where the BYTES ARE; if the two ever disagree the test fails, which is the point.
+    /// </remarks>
+    public static class WrittenAt
+    {
+        public const int MethodTableBaseSize = MtBaseSize;
+        public const int MethodTableParent = MtParent;
+        public const int EEClassInternalCorElementType = EEClassElementType;
+    }
 
     /// <summary>
     /// The <c>Exception</c> offsets the shipped descriptor publishes (§5.2), with the element

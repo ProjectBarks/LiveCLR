@@ -208,8 +208,37 @@ public class RecordedMemoryTests
 
         AssertRejected(FixtureFile.Build(region, totalBytesOverride: 0x41), "disagrees");
         AssertRejected(FixtureFile.Build(region, totalBytesOverride: -1), "Negative byte count");
-        AssertRejected(FixtureFile.Build(region, regionCountOverride: 2), "malformed");
         AssertRejected(FixtureFile.Build(region, regionCountOverride: -1), "Negative region count");
+
+        // A count LOWER than the table it precedes. This is the row that reaches the
+        // disagreement guard, and the message says so. An over-count (2 where there is 1)
+        // never gets there: it runs the reader off the end of the stream and is caught by the
+        // generic EndOfStream wrapper, whose message begins "Malformed ..." — so asserting on
+        // "malformed" matched the wrapper, and reducing the guard to nothing left the suite
+        // green (§13.11).
+        AssertRejected(FixtureFile.Build(region, regionCountOverride: 0), "disagrees");
+        AssertRejected(FixtureFile.Build(region, regionCountOverride: 2), "Malformed");
+    }
+
+    /// <summary>
+    /// The version byte on disk, pinned to a literal.
+    /// </summary>
+    /// <remarks>
+    /// Asserting against <c>CurrentVersion</c> would be §13.11 species 3 — an expectation
+    /// derived from the constant under test, which agrees with whatever that constant becomes.
+    /// <c>Rejects_a_future_format_version</c> does not cover this either: it writes 99, which
+    /// stays above any small bump, so raising the version 1 → 2 changed the bytes every
+    /// committed fixture is written with and left the suite green.
+    /// </remarks>
+    [Fact]
+    public void The_on_disk_format_version_is_one()
+    {
+        using var stream = new MemoryStream();
+        new RecordedMemoryBuilder().Add(Base, new byte[16]).Build().Save(stream);
+        byte[] saved = stream.ToArray();
+
+        Assert.Equal("LCLRFIX"u8.ToArray(), saved[..8]);
+        Assert.Equal(1u, BitConverter.ToUInt32(saved, 8));
     }
 
     [Fact]
