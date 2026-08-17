@@ -2250,9 +2250,19 @@ So: the engine tells us where the getter is, and the getter's first instruction 
 
 | Getter | RVA | Decoded | Ground truth | Name attribution |
 | --- | --- | --- | --- | --- |
-| `CanvasItem::is_visible` (release) | `0x139f520` | `0x370` | `0x370` OK | **proven** — `"is_visible"` |
-| `Label::get_text` | `0x1483bb0` | `0x800` | `0x800` OK | *unproven* — see below |
-| `RichTextLabel::get_text` | `0x1663590` | `0xa78` | `0xa78` OK | *unproven* — see below |
+| `CanvasItem::is_visible` (release) | `0x139f520` | `0x370` | `0x370` OK | **proven by name** (§16) |
+| `Label::get_text` (release) | **`0x15d11b0`** | **`0x7f8`** | `0x7f8` OK | **proven by name** (§16) |
+| `RichTextLabel::get_text` (release) | `0x1663590` | `0xa78` | `0xa78` OK | **proven by name** (§16) |
+
+> **The `Label::get_text` row was wrong, and the caveat below is what caught it.** This table
+> originally recorded RVA `0x1483bb0` decoding `+0x800`. A live `ClassDB` walk (§16) resolved
+> `Label::get_text` **by name** to RVA **`0x15d11b0`**, decoding **`+0x7f8`** — which agrees with
+> `profiles.json` and with the grid. `0x1483bb0` is a different `String` getter that merely happened
+> to sit at the offset we already believed.
+>
+> That is precisely the failure the caveat below predicted: *an offset without a name attached is not
+> evidence*, and matching a number we already believed is confirmation bias with extra steps. It was
+> flagged as unproven, and it was wrong. All three rows are now attributed by name.
 
 The `visible` stub is eight bytes: `movzx eax, byte ptr [rcx+0x370]; ret`. Its one address-taken
 reference sits at RVA `0x13aaa90`, inside the `_bind_methods` block that materialises the string
@@ -2958,3 +2968,108 @@ ABIs and should not be quoted as one.
 | **4.6** | One `AHashMap` walker + a profile | Simpler than the walk it replaces. Everything else carries over from 4.5. Optionally swap class identity to `_gdtype_ptr` for a better answer. |
 | **4.7 / master** | Re-plumb §13.4 through `GDType` | The class-metadata layer, not the ABI. Decide deliberately rather than extrapolating from 4.6. |
 | **Nothing** | getter decoder, `ObjectDB` anchor | Both premises verified intact at master. |
+
+---
+
+## 16. The `ClassDB` seed works live — name-attached corroboration, on release templates
+
+Measured on live processes, read-only, across all eight grid cells and multiple passes with **zero
+run-to-run drift and zero disagreements**. This is the independent second route §13.6 wanted, and it
+is what proved §13.2's `Label::get_text` row wrong.
+
+### 16.1 Seeding is unique, and two false positives had to be closed first
+
+No `_class_name_ptr` anywhere (it is null on 4.2–4.4 — §13.9). The chain:
+
+```
+UTF-32 "Label\0" needle -> CowData validation (size at ptr-8 == len+1, refcount at ptr-16 sane)
+  -> pointers to that buffer = &_Data.name  -> candidate _Data bases
+  -> pointers to those = element+16         -> back-link round trip (prev->next == e && next->prev == e)
+```
+
+That yields 10–17 structurally valid elements. **Identification is by content, not by size:** the
+element's own key must read back as `"Label"`, and its `ClassInfo` value must hold a real `HashMap`
+(head/tail/`num_elements` agreeing with the walked length) containing a `MethodBind` whose own
+`name`/`instance_class` `StringName`s read `"get_text"`/`"Label"`. Result on every cell, every pass:
+**exactly 1 of 17 (4.5), 1 of 10 (4.3).** Cost ≈ 3 memory passes, ~3 s per seed name.
+
+Two false positives found and closed, both §13.11 species:
+
+- **"Pick the longest chain" is wrong.** It selects GDScript's `global_map` (1373/1419 entries) on
+  4.3, and looked correct on 4.5 only by allocation luck.
+- **`_Data` bases are pool-allocated back to back**, so a candidate one slot low reads the
+  *neighbouring* interned name — every key comes out a real, plausible, **wrong** string, and
+  identification still passed. Fixed by requiring the seed element's own key to read back as the
+  name searched for.
+- A 2 KB `ClassInfo` window reaches neighbouring `ClassInfo`s: `Control::get_text` "found" Label's
+  bind until per-`MethodBind` name verification was added.
+
+Classes that bind no methods of their own (`Panel`, `VScrollBar`) identify 0 of 5 / 0 of 4 — a true
+negative, not a failure.
+
+`ClassDbElementWalk.TryEnumerate` then returns clean in <1 ms: **908 classes on 4.5, 870 on 4.3**
+(911/873 on mono cells — the extra three are the C# classes, a free sanity signal). Zero unreadable
+keys, registration order, all spot-checks present.
+
+### 16.2 Agreement, per field per target
+
+| field | 4.5-rel | 4.5-dbg | 4.3-rel | 4.3-dbg |
+| --- | --- | --- | --- | --- |
+| `canvasItem.visible` | Agree `0x370` | NoOpinion | **Agree `0x418`** | NoOpinion |
+| `control.size` | Agree `0x4c0` | NoOpinion | **Agree `0x520`** | NoOpinion |
+| `control.position` | Agree `0x4b8` | NoOpinion | **Agree `0x518`** | NoOpinion |
+| `control.scale` | Agree `0x4a8` | NoOpinion | **Agree `0x508`** | NoOpinion |
+| `node.parent` | Agree `0x128` | Agree `0x130` | **Agree `0x128`** | **Agree `0x130`** |
+| `label.text` | Agree `0x7f8` | Agree `0x800` | no independent value | no independent value |
+| `richTextLabel.text` | Agree `0xa78` | Agree `0xa80` | no independent value | no independent value |
+| **total** | 7/8 | 3/8 | **5/8** | **1/8** |
+
+Identical on the four `dotnet` cells — binding-independent, as expected.
+
+**Debug templates fail structurally, not wrongly.** Unoptimized codegen spills `this` to the stack
+and reloads it into an untracked register, so the decoder correctly reports `NoThisRelativeAccess`.
+Widening the window does not help. Fixable in principle with stack-slot tracking; not implemented.
+
+### 16.3 What this licenses — and what it must not become
+
+**The 4.3-release cap can be lifted for `visible`, `size`, `position`, `scale` and `node.parent`** —
+but **only as a live runtime cross-check computed in the same run as the bracketed answer.**
+
+Writing these numbers into `profiles.json` would recreate exactly the pass-by-construction §13.11
+refuses. **The corroboration lives in the comparison, not in a table.** 4.3-debug stays capped at
+1 of 8.
+
+It does **not** license a 4.3 `label.text`. At shipped defaults the decoder abstains
+(`NoReturnInWindow`). At a non-default `WindowBytes = 0x200` it decodes `0x8f0`/`0x8f8`, and the same
+relaxation reproduces `node.name = 0x1d0/0x1d8` matching §12.7 exactly while never changing an answer
+the default already published — suggestive, but still **one route with no independent partner**, so
+`OffsetCrossCheck` reports `NoOpinion` and should.
+
+### 16.4 It fails closed
+
+Decoded + null independent → `NoOpinion`, value null. Refused decode → `NoOpinion`. Decoded vs a
+deliberately wrong independent value → `Disagree`, **value null**. Attempts to break it:
+`Label::get_parent`, `Label::is_visible`, `Control::get_text` (inherited, not in the class's own
+`method_map`) and `Label::get_texxt` all → no bind, so no name, so no comparison. Computed getters
+refuse correctly — `Engine::get_time_scale` → `NoThisRelativeAccess`; `Node::get_child_count` →
+`AmbiguousAccesses` naming all four fields; `Object::get_class` → `DisplacementOutOfRange`.
+
+### 16.5 Shipped-code defects and doc corrections this run produced
+
+- **`MethodBindProbe.DefaultProbeSlots = 8` refuses 100% of probes on all 8 cells.**
+  `sizeof(MethodBind)` measures **0x48 release / 0x58 debug** on both versions, so the method pointer
+  is at slot 9 or 11. The default needs to be ≥ 12. §13.7 predicted the shift; the shipped default
+  never accommodated it.
+- **`ClassDbLayout.Godot43.HashMapSize = 48` is wrong** — `sizeof(HashMap)` measures **40 bytes on
+  both 4.3 and 4.5** (`num_elements` at head+0x14, head at map+16). Harmless today because the
+  element chain never uses it. Note this **contradicts §15.3's source-derived 48→40 boundary at
+  4.4→4.5**; source and measurement disagree and the discrepancy is unresolved.
+- **§13.7's "a 4.3 reader must check `cname` first" is backwards.** On 4.3 `_Data.cname@+0x8` exists
+  but is **null** for class names; `name@+0x10` is populated. Checking `cname` first is harmless only
+  because it is null.
+- `ClassInfo::method_map` is at `+0x30` (4.5) / `+0x38` (4.3), found structurally, never hardcoded.
+- **`label.text 0x7f8` and `richTextLabel.text 0xa78` are now stock-template verified by name**, so
+  `profiles.json`'s `stockTemplateVerified: false` can be retired for those two. 4.5-debug `0x800` /
+  `0xa80` are likewise confirmed with a name attached, independently refuting scry's `0x848`/`0xb18`.
+- The route never touches `property_setget`, so `GodotReflectionSupport`'s 4.6 refusal may be
+  stricter than necessary for this path. Whether `method_map` survives 4.6 is **not measured**.
