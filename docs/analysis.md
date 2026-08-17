@@ -198,12 +198,24 @@ copies it into the engine object at `+0x3c`. So the variants are **debug vs rele
 template**, *not* Godot version — debug templates carry extra fields, which is why the layouts
 differ by ~80 bytes.
 
+> **Sharper than "version-keyed": scry has no version table at all.** The parser stores
+> `{u16 major, u16 minor, u16 patch, …, u8 isDebug}` — and **major/minor/patch are never read by
+> anything.** Every accessor tests exactly one byte, `*(char*)(engine + 0x3c)`. There is no
+> 4.3-vs-4.5 branch anywhere in the binary.
+>
+> That is a significant limitation, not a simplification: scry's Godot offsets are correct for the
+> one engine version they were measured against and silently wrong on any other. §12.7's measured
+> table shows how far apart 4.3 and 4.5 actually are (`control.offset` moves `0x68`). Calibration
+> is not a nicety here — it is the difference between supporting one build and supporting the
+> engine.
+
 `connection.ts:16` passes `'4.5.1'` with no suffix, and StS2 ships a release template, so
 **the release column is ours.**
 
 | Class | Accessor | Impl | **Release** (flag = 0) | Debug (flag = 1) | Shape | Verified |
 | --- | --- | --- | --- | --- | --- | --- |
 | CanvasItem | `isVisible` | `FUN_180011e30` | **`0x370`** | `0x3c0` | bool (vtable `+0x00`) | branch |
+
 | Control | `getGlobalPosition` | `FUN_180012c70` | **`0x3f8`,`0x3fc`** | `0x448`,`0x44c` | 2 floats (Vector2) | branch |
 | Control | `getOffset` | `FUN_180012d60` | **`0x470 + i*4`**, i=0..3 | `0x500 + i*4` | 4 floats | branch |
 | Control | `getScale` | `FUN_180012f50` | **`0x4a8`,`0x4ac`** | `0x4f8`,`0x4fc` | 2 floats | pattern |
@@ -213,6 +225,46 @@ differ by ~80 bytes.
 | Node | `getChildren` | `FUN_1800163a0` | delegates | | list walk | — |
 | Node | `getName` | `FUN_180016580` | delegates | | string | — |
 | Node | `getDotNetCoreObject` | `FUN_180016610` | delegates | | bridge | — |
+
+### `CanvasItem::visible` and its thirteen decoys
+
+`visible` is **one full byte, no mask** — and it sits in a run of booleans that are exactly what a
+value-scanning calibrator loses to. Layout verified from `scene/main/canvas_item.h`, **identical in
+4.3 and 4.5** with no `#ifdef`s. With `V` = offset of `visible`:
+
+| Offset | Field | Runtime behaviour |
+| --- | --- | --- |
+| `V−12` / `V−11` | `z_relative`, `y_sort_enabled` | static |
+| **`V−8`** | **`Window *window`** | **a pointer — the key discriminator** |
+| **`V+0`** | **`visible`** | the stored property |
+| `V+1` | `parent_visible_in_tree` | true iff all ancestors visible — decoy |
+| `V+2` | `pending_update` | **flips every frame** |
+| `V+3`…`V+7` | `top_level`, `drawing`, `block_transform_notify`, `behind`, `use_parent_material` | mixed |
+| `V+8` | `notify_local_transform` | static, usually 0 — decoy |
+| `V+9`…`V+10` | `notify_transform`, `hide_clip_children` | static |
+| `V+12` | `clip_children_mode` (u32) | ∈ {0,1,2} |
+
+Note `is_visible_in_tree()` is **computed**, never stored — so there is no cached tree-visibility
+byte to confuse with the property.
+
+**Two structural discriminators that need no timing:**
+
+1. **`visible` is always ≡ 0 (mod 8).** `CanvasItem`'s prefix through `window` is exactly `0x80`
+   bytes and `sizeof(Node)` is 8-aligned. That single rule eliminates **11 of the 13** boolean
+   decoys; only `visible` and `notify_local_transform` survive.
+2. **Read the qword at `V−8`.** For real `visible` that is `Window *window` — zero or a canonical
+   heap pointer. For `notify_local_transform` the same qword spans eight bools, so it is non-zero
+   with every byte ≤ 1. Reject on that pattern and the last decoy is gone.
+
+> **A temporal stability test discriminates against the correct answer here.** In a live UI
+> `visible` genuinely toggles between two readings — cards, tooltips, panels animating — so
+> "the byte must be identical across two reads" rejects the *real* field while the stable decoys
+> are eliminated by the differs-between-pair test, leaving nothing. That is precisely the
+> "never wrong, always absent" failure §12.7 measured at 11 of 24 runs. Structure beats sampling.
+
+**Also: the calibration pair must differ in the node's *own* flag.** If a node is invisible because
+an *ancestor* is hidden, `visible` is identical on both and the byte that differs is
+`parent_visible_in_tree` at `V+1`.
 
 **Independent corroboration.** Godot's
 [`scene/gui/control.h`](https://github.com/godotengine/godot/blob/master/scene/gui/control.h)
@@ -258,8 +310,17 @@ constants**, confirmed in the disassembly, not a misreading on our part.
 
 **There is a second debug-column defect**, found while encoding the table: debug `scale` (`0x4f8`)
 sits *below* debug `offset` (`0x500`), **inverting the field order** that the release column and
-upstream `control.h` both agree on (`offset[4]` → `anchor[4]` → … → `scale`). Two independent
-inconsistencies means the debug column should be treated as evidence-free, not merely uncertain. The debug template is
+upstream `control.h` both agree on (`offset[4]` → `anchor[4]` → … → `scale`).
+
+> ### The debug column is now MEASURED, and it was wrong — replace it
+>
+> The ABI grid exported real stock Godot templates and derived the offsets independently
+> (§12.7). **8 of 13 debug values here are contradicted.** The measured column is self-consistent
+> (`offset < scale < position < size`, matching release); this one was not. Use the measured table
+> in §12.7. The only entry this column got right is `node.scriptInstance` at `0x70`.
+>
+> The recovered pattern is much simpler than either guess: **debug = release + `0x8`, uniformly,
+> for every field in both 4.3 and 4.5.** The debug template is
 presumably an untested path for them. Irrelevant to us; the release column is what we use and it
 is validated 30/30 (§12.3) plus 60/60 on combat nodes (§12.4c).
 
@@ -326,6 +387,18 @@ keep that approach.
 3. bulk-read `len * 4` bytes via vtable `+0x10` (one block read, not per-character)
 4. decode
 
+**There is a third header word, and it is the one that makes validation possible.** `CowData`'s
+layout is `REF_COUNT_OFFSET = 0`, `SIZE_OFFSET = 8`, `DATA_OFFSET = 16` — identical in 4.3 and 4.5,
+with `USize = uint64_t`. So for a `_ptr` **P**: `size` is at `P−8` and **`refcount` at `P−16`**.
+
+That second header word is an *independent* constraint a random qword will not satisfy, and
+together with `P % 16 == 0` and the NUL terminator at `P + (size−1)*4` it is what distinguishes a
+real Godot `String` from arbitrary pointer-shaped bytes.
+
+**Scry performs none of these checks.** Its entire validation is a single `ptr == 0` early-out — a
+wrong offset either throws or silently returns garbage. Copying its trust model is how a calibrator
+ends up decoding a different wrong address on every run.
+
 **Two traps in that recipe, found while implementing it:**
 
 - **The stored count includes the trailing NUL.** A literal implementation of steps 1–4 appends
@@ -339,6 +412,21 @@ anything else.** Our implementation should decode UTF-32 properly and always use
 
 Vtable slots observed across the Godot layer: `+0x00` bool/byte, `+0x10` readBytes (bulk),
 `+0x28` float, `+0x40` pointer, `+0x60` uint32, `+0x68` uint64/size.
+
+**Scry's `Label.text` offset is probably `xl_text`, not `text`.** Every other constant in its table
+has a debug−release delta of exactly `0x50`. `Label.getText` has `0x48` — **one `String` slot
+short**. Godot declares `String text` immediately followed by `String xl_text`, so the consistent
+reading is that its release constant points at the translated copy and its debug constant at the
+original. It never mattered to scry because `set_text` does `xl_text = atr(text)`, and the
+non-translating path returns by value — so `CowData::_ref()` shares the allocation and
+**`xl_text._ptr == text._ptr` exactly, with refcount ≥ 2.** The two only diverge when a translation
+actually resolves, at which point their contents legitimately differ.
+
+Practical rule: accept either slot of the pair and prefer the lower.
+
+**`RichTextLabel` has no `xl_text` member at all** — `_apply_translation()` uses a local. It has
+exactly one stored `String`, holding the **raw BBCode source**, so any expected-text comparison
+against *rendered* text will never match on a bbcode-enabled node.
 
 **Composing global position has a type trap.** `Control.position` is a `Control` field, but the
 scene tree contains non-`Control` ancestors. Walking up and reading that offset off, say, an
@@ -1526,6 +1614,112 @@ a hypothetical one.
 only surfaces *scalar* fields — so no struct field was ever in the comparison set. The bug was
 found by an independent audit walking every `FieldDesc`, not by the agreement test. A passing
 comparison bounded by the weaker tool's coverage is not the reassurance it appears to be.
+
+---
+
+## 12.7 The ABI grid ran — measured offsets across two engine versions
+
+§8.9 proposed manufacturing the compat matrix from stock export templates, and §8.6 made publishing
+`Godot.External` conditional on the calibrator solving a layout it had never seen. Both were run
+for real against Godot 4.5-stable and 4.3-stable.
+
+### The gate is met
+
+`4.3-release-single-gdscript` and `4.3-debug-single-gdscript` each scored **12/15 on the first
+attempt**, with `calibration.unaided` green and **no 4.3 profile in existence**. Every derived
+offset was verified against the authored scene — sizes, positions, scales, anchor offsets,
+visibility, all 20 `StringName`s, child order, parent round-trip.
+
+**The calibrator derives layouts it has never seen.** That is the claim §8.9 said was worth
+publishing, demonstrated rather than argued.
+
+### Measured offsets
+
+Derived independently by both bindings, which agreed exactly:
+
+| Field | 4.5 release | 4.3 release | 4.5 debug | 4.3 debug |
+| --- | --- | --- | --- | --- |
+| `node.parent` | `0x128` | `0x128` | `0x130` | `0x130` |
+| `node.childListHead` | `0x148` | `0x150` | `0x150` | `0x158` |
+| `node.name` | `0x1c0` | `0x1d0` | `0x1c8` | `0x1d8` |
+| `canvasItem.visible` | `0x370` | `0x418` | `0x378` | `0x420` |
+| `control.offset` | `0x470` | `0x4d8` | `0x478` | `0x4e0` |
+| `control.scale` | `0x4a8` | `0x508` | `0x4b0` | `0x510` |
+| `control.position` | `0x4b8` | `0x518` | `0x4c0` | `0x520` |
+| `control.size` | `0x4c0` | `0x520` | `0x4c8` | `0x528` |
+| `childList.next` / `.node` | `0x0` / `0x18` | `0x0` / `0x18` | `0x0` / `0x18` | `0x0` / `0x18` |
+
+Two structural facts fall out:
+
+- **Debug is release + `0x8`, uniformly** — every field, both versions. The §4.6 debug column's
+  irregularity was error, not engine behaviour.
+- **4.3 → 4.5 is not a uniform shift.** `node.parent` unchanged, child-list head `−8`, name
+  `−0x10`, and the whole `Control` block `−0x60` (`visible` `−0xa8`, `offset` `−0x68`). A
+  per-version table is unavoidable; calibration is what makes that survivable.
+
+### Two cross-checks worth more than the table
+
+**§4.6's release column is confirmed 10/10 — and the "modified engine" caveat is retired.** The
+grid derived those offsets from scratch on a **stock** 4.5 template, and they match the values
+recovered from the shipped game. Every prior section warning that StS2 runs a *modified* Godot and
+so upstream layouts may not apply was right to be cautious, but for the `Control` block the fork's
+layout **is** the stock layout.
+
+**§4.6's debug column is contradicted 8/13**, exactly as it suspected of itself — see the
+correction there. A later run gave a **third** independent confirmation: the harness's
+`profile.agreement` check fails on both 4.5-debug cells, and the derived values preserve the
+release field ordering while the shipped debug column does not.
+
+### Reproducibility
+
+The grid was then re-run **three times at one attempt per cell** — 24 cell-runs — after fixing a
+nondeterminism in the calibrator's root location. Results:
+
+- **Zero offset disagreements** across 40 result files spanning six full grid runs. All 32 table
+  entries confirmed on every cell, every run, with zero run-to-run drift. The measured offsets are
+  reproducible, not a lucky sample — which is the claim that matters, since a calibrator that
+  derives a *different* answer each run would be useless regardless of whether any single answer
+  was right.
+- `4.5-release-single-dotnet` reached **17/17 on three consecutive runs** — the first cell to score
+  full marks reproducibly.
+- **But 5 of 8 cells still flip between runs**, so the matrix as a whole is not yet evidence. One
+  cell scored 16/16 in a single run out of three; that number is not quotable and was not quoted.
+  The remaining instability is concentrated in two derivations (`canvasItem.visible`, and text
+  offsets that are found per-node rather than per-class) rather than being spread across the ABI
+  work.
+- A new binding-dependent fact fell out: `scriptInstance.ownerBackref` is `0x8` on .NET cells and
+  `0x10` on GDScript cells, stable across all runs. It appears in no profile yet.
+- **Zero root-location failures**, against a prior regime of roughly 2-in-5 success on one cell and
+  14/14 failures on another. The harness's retry workaround was deleted as a result.
+- The managed bridge (`Probe.Instance` → `NativePtr` → walk root, plus the reverse
+  `ScriptInstance` → GCHandle chain) passes on **all four** .NET cells.
+
+**A retry loop that hides nondeterminism is worse than a red cell.** The harness had grown one to
+work around the defect, disclosed in every report row. Fixing the cause and deleting the workaround
+is what makes the matrix mean anything — a green obtained on the sixth attempt is not the same
+claim as a green obtained on the first.
+
+### Harness defects found by running it
+
+The harness had only ever driven a mock. Five real bugs surfaced, all fixed without weakening a
+check:
+
+1. **A .NET export silently produced a broken game.** Godot's exporter needs a `.sln`, which
+   `--build-solutions` does not create headless. It logged ERROR, **exited 0**, and wrote a valid
+   native `grid.exe` with no managed payload — which then died with `0xC0000005`. "The exe exists"
+   is not success.
+2. **The ground truth was wrong about the tree.** `RichTextLabel` adds an internal
+   `@VScrollBar@2` child that `.tscn` parsing and `get_children()` both hide — but a memory walk
+   cannot. Asserting 20 nodes while the walk found 21 did not merely fail the cell: it made the
+   *correct* layout unacceptable, so the search settled on an unrelated `SelfList` chain that
+   threads every node and crashed the driver.
+3. **The scene could not separate the parent pointer.** Godot caches it three times
+   (`Node::data.parent`, `CanvasItem::parent_item`, `Control::data.parent_control`), and in an
+   all-`Control` tree all three are identical for every pair. Fixed by making one sibling a bare
+   `Node`.
+4. **net8.0 exports were unmeasurable by construction** — the bundled .NET 8 runtime exposes no
+   readable `DotNetRuntimeContractDescriptor`, so the managed bridge could never be tested.
+5. `build.ps1` must stay ASCII — PS 5.1 reads it as ANSI and an em dash is a parse error.
 
 ---
 
