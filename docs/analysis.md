@@ -2429,10 +2429,18 @@ observable lifetime of every node. Fixed by [PR #105099](https://github.com/godo
 (merged 2025-04-08), **milestone 4.5 only** — the reset was deleted and the logic moved to
 `Object::_initialize()`. Verified **not** cherry-picked to 4.4.x against 4.4.1-stable.
 
-| Version | Field present | Nulled in postinit | Live value |
+| Version | Field present | Nulled after init | Live value |
 | --- | --- | --- | --- |
 | 4.2 / 4.3 / 4.4 / 4.4.1 | yes | yes | **always 0** |
 | 4.5 | yes | **no** | populated |
+
+> **Two corrections, both verified at the specific tags.** On **4.4** the nulling lives in
+> `Object::_initialize()` (`object.cpp:243-246`), not `_postinitialize()` — 4.4 split the two
+> functions, and the code block above is accurate for 4.3 (`object.cpp:211-213`) but mislabelled for
+> 4.4. The effect is identical: the only other write is `_predelete()`, so the slot reads 0 for every
+> node's observable lifetime. And the "not cherry-picked" claim is now **exhaustive rather than
+> sampled** — the tag list contains exactly two 4.4.x tags, `4.4-stable` and `4.4.1-stable`, whose
+> `object.cpp` files are byte-identical and both carry the reset.
 
 So treat a zero on 4.2–4.4 as **structurally unavailable**, not as a calibration failure — and expect
 4.4 cells to fail identically if the grid adds them. Nothing else in 4.3 carries per-instance class
@@ -2843,3 +2851,110 @@ statics carries `DynamicStatics`, which is why nobody noticed.
 `EEClass + 0x18 = m_pFieldDescList`, `sizeof(FieldDesc) = 0x10`, and the FieldDesc bitfields are
 worth taking as **calibration hypotheses to test first**, not as hardcodes — `EEClass+0x18` sits
 immediately after the descriptor-published `EEClass.MethodTable = 16`.
+
+---
+
+## 15. Cross-version: 4.4 is nearly free, 4.6 is easy, 4.7 is the real work
+
+Source verification at tags `4.3-stable`, `4.4-stable`, `4.4.1-stable`, `4.5-stable`, `4.6-stable`,
+`4.7-stable` and `master`. No binaries were decoded — Godot ships templates only as ~1 GB `.tpz`
+bundles, so there is no cheap per-binary download. **Everything here is source-only.**
+
+Both §13 predictions were confirmed on their headline. One sub-premise was refuted, and it matters
+less than expected. Three things were not predicted at all, and one of them would have caused silent
+wrong answers.
+
+### 15.1 The prediction that held, and the trap underneath it
+
+`_class_name_ptr` is nulled on 4.2/4.3/4.4/4.4.1 and populated from 4.5 — confirmed exhaustively
+(see the correction in §13.9). The RTTI replacement's premises all hold at 4.4: `Object` polymorphic
+with no bases (`object.h:1004`), the full single-inheritance chain to `Label` intact, `GDCLASS`
+forbidding a second base, `/GR` on the MSVC path with no `-fno-rtti` anywhere, `TYPED_METHOD_BIND`
+defined.
+
+**But 4.4's offsets are not 4.3's offsets, and nothing predicted that.** Verified layout-changing
+edits between `4.3-stable` and `4.4-stable`, all sitting *above* the fields this project reads:
+
+- `Object` gains `StringName _translation_domain` (`4.4 object.h:680`) — **+8 bytes, shifting every
+  `Node`/`CanvasItem`/`Control` field below it.**
+- `Node::Data` gains three bitfield bools plus two translation-domain flags.
+- `CanvasItem` gains two `HashMap` members (`4.4 canvas_item.h:118`) — *after* `visible` (line 98),
+  so `visible`'s intra-class offset survives but **the whole `Control` block below moves ~96 bytes.**
+- `Control::Data` gains `tooltip_auto_translate_mode`.
+- `Label` is restructured: per-paragraph state moves into a nested `struct Paragraph`.
+
+`Label::text`/`xl_text` survive as adjacent inline `String` members at the head of the private block
+on **every** tag 4.3 → master, as does `RichTextLabel::text`. So the *fields* are stable and only
+their addresses move — harmless for a calibrator that derives, **silently wrong for any 4.3-derived
+table reused on 4.4.** That is the one mistake available here and it is an easy one to make.
+
+### 15.2 The refuted sub-premise — `AHashMap` is not doubly-linked, and that is fine
+
+`property_setget` becomes `AHashMap` at `4.6-stable class_db.h:157` (confirmed, also at 4.7 and
+master). But §13.7's implied worry was wrong: `AHashMap` is not a linked structure **at all** —
+`a_hash_map.h:82-103` is a dense `_elements` array plus an open-addressing `_metadata` index, with no
+`next`, no `prev`, no head. The §13.4 property — *find one element and enumerate the map without
+locating the root* — is simply gone for it.
+
+**It was never load-bearing there.** That property mattered only for `ClassDB::classes`, which the
+walker cannot address directly. `property_setget` lives *inside* a `ClassInfo` the walker already
+holds, so its root is free. And **`ClassDB::classes` remains `HashMap` at every tag through master**,
+so the anchor chain keeps its linked-list property. Net: the 4.6 walker is a 24-byte header read plus
+a dense scan of `_size` entries — **simpler than the 4.5 walker, not harder.**
+
+### 15.3 Corrections to §13.7's version table
+
+- **`HashMap` 48→40 happens at 4.4→4.5, not 4.3→4.5.** Cause pinned: 4.3/4.4 declare
+  `Allocator element_alloc;` as the first member; 4.5+ use `class HashMap : private Allocator`
+  (`4.5 hash_map.h:68`) and empty-base-optimization erases it. Consequence beyond size:
+  **`head_element` sits at `+0x18` on 4.3/4.4 and `+0x10` on 4.5+.** (The EBO reasoning is inference;
+  the source change is verified and agrees with the project's independently measured 48→40.)
+- **`StringName::_Data` keeps `cname`/`idx` on 4.4** as well as 4.3, dropped at 4.5, unchanged
+  through master. So 4.4 uses the 4.3 reader.
+- **`MethodBind` is unchanged 4.3 → master** — identical member list at every tag; only the guard
+  macro was renamed (`DEBUG_METHODS_ENABLED` → `DEBUG_ENABLED` at 4.5). `arg_names` is still the only
+  debug-conditional member, so the "probe the first few qwords" heuristic stays valid everywhere.
+  `MethodBindTRC` still stores `method` as the first member after the base under `TYPED_METHOD_BIND`
+  on master (moved to `method_bind_common.h:317-318`), and `TYPED_METHOD_BIND` is still defined on
+  Windows at 4.6, 4.7 and master. **The getter decoder's premise survives to master.**
+- **`ObjectDB::ObjectSlot` unchanged 4.3 → master** — same 39/24/1 bitfields. The §13.4 anchor needs
+  no work at any version.
+
+### 15.4 Unpredicted: 4.6 gives back something better than RTTI
+
+`_class_name_ptr` is replaced by `mutable const GDType *_gdtype_ptr` (`4.6 object.h:672`), set in
+`_initialize()` and — crucially — **never reset**; only `_predelete()` nulls it. `GDType`
+(`core/object/gdtype.h`) is `{ const GDType *super_type; StringName name; Vector<StringName>
+name_hierarchy; }`, so **one pointer chase yields the class name *and* the entire inheritance chain**,
+`Object` last. Strictly more than the RTTI route gives, and it fixes the GDExtension case §13.9
+flagged (`object.cpp:1437` assigns `_extension->gdtype`).
+
+4.6 also adds a **free ancestry test**: `Object::_ancestry` is a 15-bit field (`object.h:653`) over
+`enum class AncestralClass` with `NODE = 1<<1`, `CANVAS_ITEM = 1<<4`, `CONTROL = 1<<5`. The
+CanvasItem gate of §13.11 becomes **one masked dword read**, no name resolution and no `__base_type`
+walk.
+
+4.6 moves offsets again, hard: `Object` *shrinks* (`Variant script` removed, five bools collapsed
+into bitfields), `CanvasItem` replaces `List<CanvasItem*> children_items` + `Element *C` with a
+`LocalVector` plus `index_in_parent`, and `Control::Data` gains `pivot_offset_ratio`. New profile
+required — but that is a calibration run, not a code change.
+
+### 15.5 Unpredicted: 4.7 is a different problem, and the doc collapsed three ABIs
+
+`ClassInfo` at `4.7 class_db.h:120-157` **loses `StringName inherits` and `StringName name`
+entirely**, along with `constant_map`, `enum_map` and `signal_map` — all folded into `GDType`. Any
+walker reading a class name out of `ClassInfo` breaks at 4.7 and must go through
+`ClassInfo::gdtype->name`. 4.6 is the transitional tag carrying both.
+
+And **4.6 and 4.7 are shipped stable tags now** (`4.6-stable`…`4.6.3-stable`,
+`4.7-stable`…`4.7.2-stable`), not branches. §13.7's "4.6/master" framing collapses three now-distinct
+ABIs and should not be quoted as one.
+
+### 15.6 What the calibrator needs, ranked
+
+| Version | Work | Why |
+| --- | --- | --- |
+| **4.4** | **A version-gate entry + one calibration run** | RTTI already covers identity, and every version-sensitive reader 4.4 needs *already exists for 4.3* — the `cname`-bearing `StringName::_Data`, the 48-byte `HashMap` with `head_element` at `+0x18`, the `HashMap` walker, unchanged `MethodBind` and `ObjectSlot`. **The matrix widens to 4.2–4.5 for the cost of a table entry.** The one thing that would fail is treating 4.4 as an alias for 4.3's *offsets*. |
+| **4.6** | One `AHashMap` walker + a profile | Simpler than the walk it replaces. Everything else carries over from 4.5. Optionally swap class identity to `_gdtype_ptr` for a better answer. |
+| **4.7 / master** | Re-plumb §13.4 through `GDType` | The class-metadata layer, not the ABI. Decide deliberately rather than extrapolating from 4.6. |
+| **Nothing** | getter decoder, `ObjectDB` anchor | Both premises verified intact at master. |
