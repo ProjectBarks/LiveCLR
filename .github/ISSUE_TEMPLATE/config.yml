@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security issue
+    url: https://github.com/ProjectBarks/LiveCLR/security/advisories/new
+    about: Report privately. Anything that writes to, suspends, or executes code in a target belongs here.
+  - name: Is my scenario in scope?
+    url: https://github.com/ProjectBarks/LiveCLR#limits
+    about: Static fields, non-Windows, and NativeAOT are known gaps - check Limits before filing.
