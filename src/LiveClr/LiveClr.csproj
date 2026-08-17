@@ -1,9 +1,39 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <!-- Windows-only by construction: the reader is ReadProcessMemory/PSS. -->
+    <SupportedOSPlatform>windows</SupportedOSPlatform>
+    <!-- Without this the extensive XML docs are compiled away and never reach a package. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!--
+      CS1591 (missing doc on a public member) is suppressed rather than enforced. Turning it on
+      mid-flight failed 87 builds in files another agent was still writing. Docs that exist still
+      ship; revisit before the first package publish, when the API surface has settled.
+    -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <AnalysisLevel>latest</AnalysisLevel>
   </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>LiveClr</PackageId>
+    <Description>Read-only, out-of-process inspection of a running .NET 9+ process. Resolves types, statics and object graphs by name using the runtime's own cDAC contract descriptor and ECMA-335 metadata — no DAC, no injection, no suspension, no hardcoded CLR version table.</Description>
+    <PackageTags>clr;diagnostics;cdac;memory;introspection;readprocessmemory</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" Condition="Exists('..\..\README.md')" />
+  </ItemGroup>
 
 </Project>
