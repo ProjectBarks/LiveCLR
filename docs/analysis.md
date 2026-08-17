@@ -2692,6 +2692,66 @@ with `GetDynamicStaticsInfo(aux) = aux - sizeof(DynamicStaticsInfo)` and
 `& ~1` is that verbatim, and its version gate is `MethodTable::IsDynamicStatics()` on both branches —
 a faithful port of `FieldDesc::GetBase()`'s dispatch, not a measured constant.
 
+### 14.0 VERIFIED LIVE — and three corrections to what follows
+
+Measured against a running .NET 9 process (SlayTheSpire2, CoreCLR 9.0.x, read-only
+`ReadProcessMemory`): **12,283 validated MethodTables across 25 managed assemblies, 27,732 static
+FieldDescs.** Steps 1–5 of the chain hold as written. Nothing here needs retracting. Ground truth,
+checkable outside the process:
+
+- `System.Environment.s_processId` → **418440**, the target's actual OS PID.
+- `MegaCrit.Sts2.Core.Debug.ReleaseInfoManager._instance` → every field matching `release_info.json`
+  on disk (commit `59260271`, version `v0.107.1`, `MainAssemblyHash -1555940892`, date ticks
+  converting to the file's timestamp).
+- Control: reading **the identical fields from the wrong base** yields **0 valid objects out of 529**.
+  The test therefore has full discriminating power, so 0 garbage across 17,982 dispatched fields is a
+  result rather than a tautology.
+- 200,000 addresses drawn near real MethodTables: 24,819 passed the flags gate, 37 passed gate *and*
+  anchor, and all 37 independently validate as real MethodTables under an unrelated test (generic
+  instantiations absent from the corpus). **Genuine false positives: zero.**
+
+**Correction 1 — slot 40 aliases the anchor. Derive the slot once and freeze it; never sweep per
+lookup.** §14.3 says to sweep the slots between `Module = 24` and `EEClassOrCanonMT = 40`. That is
+safe only if "between" is *exclusive*: there is then exactly **one** 8-aligned candidate, `0x20`, and
+the "three or four candidate slots" phrasing below is wrong. Measured:
+
+| slot | anchor holds, gate set | gate clear |
+| --- | --- | --- |
+| **32 (`0x20`)** | **3033 / 3033 (100%)** | 0 / 4000 |
+| 40 (`EEClassOrCanonMT`) | 4 / 3032 | 16 / 4000 |
+| every other slot 0…72 | 0 | 0 |
+
+26 types satisfy `ptr(ptr(mt+40)-8) == mt` by coincidence, so a **per-type inclusive sweep picks the
+wrong slot for four of them** (`EpochModel`, `MonsterModel`, `OrbModel`, `PowerModel`). Derive by
+unanimity over ≥100 gate-set types once at connect, then use the frozen value.
+
+**Correction 2 — thread statics are not handled and will produce a confident wrong address.**
+`FieldDesc` bit **25** marks a thread-local static (28 in the corpus, e.g. `Thread.t_currentThread`).
+They pass the gate *and* the anchor, but the aux GC/non-GC bases **do not apply to them**. §14.1
+decodes `m_isStatic` (bit 24) and `m_isRVA` (bit 26) and silently skips bit 25. **Check it and
+refuse.** Likewise §14.3's recommended design drops `isRVA` entirely, which §14.1 does decode — 243
+RVA statics need their own path.
+
+**Correction 3 — open generic type definitions have no statics storage.** 3,385 GC-dispatched
+statics read `gcRaw == nonGcRaw == 1` (`ArrayPool\`1.s_shared`, `EmptyArray\`1.Value`). The
+instantiation's MethodTable is required. The chain refuses correctly, so this is a *capability* limit
+rather than a correctness bug — but a caller resolving by TypeDef name simply gets nothing, and
+per-instantiation `GenericsStaticsInfo` was not tested.
+
+Two smaller notes. The gate is **exact and fails safe**: zero of 12,283 types with statics had it
+clear, so there are no false refusals; the 8 gate-set-without-statics are all
+`<PrivateImplementationDetails>` carrying RVA statics only. And the constant `0x0002` is **not
+descriptor-published** — it is measured here to mean precisely "a `DynamicStaticsInfo` precedes the
+auxiliary data", so on a future runtime it should be *derived* (pick the `MTFlags2` bit that
+perfectly predicts the anchor) rather than hardcoded.
+
+`ISCLASSNOTINITED` is also confirmed as meaningful rather than incidental: `Boolean.TrueString` reads
+null because `Boolean`'s raw GC base is `0x1A2FB020CE1` — low bit set, class never initialized in
+this process. Types whose base has bit 0 clear return live values. So the `& ~1` masking is measured,
+and "null" and "class not initialized" are distinct states that should not be collapsed.
+
+Scope: one runtime, one build. Nothing here speaks to .NET 10.
+
 ### 14.2 The calibration anchor §5.5 says does not exist
 
 `DynamicStaticsInfo`'s third member is a **back-pointer to the MethodTable**:

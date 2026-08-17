@@ -88,7 +88,7 @@ Honest boundaries, each traceable to what the .NET 9 descriptor actually publish
 
 | Gap | Status |
 | --- | --- |
-| **Static field addresses** | **Not implemented.** No `DomainLocalModule`, no MT auxiliary data, and no known-address managed static to calibrate against. Supply via `IClrStaticRootSource` — ClrMD, suspended, once at connect. |
+| **Static field addresses** | **Not implemented — but no longer believed impossible.** This row previously read "no MT auxiliary data, and no known-address managed static to calibrate against". Both were wrong. `m_pAuxiliaryData` is at `MethodTable+0x20`, and `DynamicStaticsInfo` sits immediately below it carrying a **back-pointer to the MethodTable at `aux-8`** — a self-validating anchor, measured at 3033/3033 across 25 assemblies on a live .NET 9 process, with GC statics at `aux-0x18` and non-GC at `aux-0x10`, masked `& ~1`. Verified end to end by reading `Environment.s_processId` and getting the target's real PID. See `docs/analysis.md` §14. Until it is implemented here, supply via `IClrStaticRootSource` — ClrMD, suspended, once at connect. |
 | Instance field offsets | Derived, not read. `FieldDesc` is unpublished, so the encoding is calibrated against eight published `System.Exception` offsets. Converges or refuses; never guesses. **Not yet verified against a live runtime.** |
 | `AppDomain` / `Assembly` walk | Unpublished. Seed a module, or resolve any object and its module registers itself. |
 | Segmented `ModuleLookupMap` | `Count`/`Next` unpublished. Correct for single-segment maps; degrades to "not found" beyond, never to a wrong answer. |
