@@ -566,7 +566,15 @@ specifies the algorithm, so it need not be reverse engineered: AppDomain → `As
 `IsLoaded`/`IsCollectible`/`Error` → `Assembly.Module` → `SimpleName` (UTF-8), `Path`/`FileName`
 (UTF-16). `ModuleLookupMap`s are segmented: read a segment's `Count`, index `TableData` if in
 range, else subtract and follow `Next`; mask flag bits with `SupportedFlagsMask` (valid only on
-the first segment); enumeration starts at index 1.
+the first segment).
+
+> **None of `Count`, `Next` or `SupportedFlagsMask` is published by the .NET 9 descriptor** (§5.5).
+> So this documented algorithm cannot be implemented as written: bound the walk by the metadata row
+> count instead of a segment `Count`, and **derive** the flag mask rather than reading it — the
+> field-offset calibration in §8.8 exists partly for this reason. What follows describes the
+> contract, not what .NET 9 lets you do.
+
+Enumeration starts at index 1.
 
 ### 5.5 The honest gap
 
@@ -1181,6 +1189,16 @@ enum SnapshotMode { LiveValidated, ProcessSnapshot }
 - **`ProcessSnapshot`** — `PssCaptureSnapshot`, which is what ClrMD itself recommends over
   unsuspended inspection.
 
+> **Measured, and it settles the open question: PSS is NOT a viable product mode.** An early
+> benchmark on a small test host gave ~1 ms and this section speculated it might replace the whole
+> consistency layer. Against the **real game** (316 MB working set) the median capture is
+> **193 ms** (188–196). At 4 Hz that is a fifth of every second spent capturing, with a 193 ms
+> stall each time — unusable for an overlay. Cost scales with the target's VA size, exactly as the
+> caveat warned.
+>
+> PSS remains valuable as a **correctness oracle** in tests, which is where it now belongs. The
+> page cache stays the product mechanism.
+
 **Its first job is as a correctness oracle**: diff `LiveValidated` against a PSS-coherent read to
 build a randomized test for exactly the §12.4e tearing class — the one bug we found that is
 otherwise silent.
@@ -1437,6 +1455,77 @@ decompiles nearly intact.
 **The runtime is more informative than the binary.** The single highest-value step in this
 whole analysis was not decompilation — it was reading `coreclr.dll`'s export table and parsing
 40 bytes of static data.
+
+---
+
+## 10b. Live validation of the reimplementation
+
+The C# rewrite was run against the real game for the first time — pid 418440, CoreCLR
+9.0.725.31616, the exact build §5.2's descriptor was extracted from.
+
+| Step | Result |
+| --- | --- |
+| Attach + module discovery | **PASS** — 198 modules, `coreclr.dll` @ `0x7FFD41C20000`, 1.0 ms |
+| Remote PE export walk | **PASS** — descriptor found at `coreclr+0x461D30`, 3.5 ms |
+| Descriptor header + JSON | **PASS** — `DNCCDAC\0`, 3201 B |
+| **Byte-exact vs static extraction** | **PASS** — identical char-for-char; 0 diffs across 29 types / 95 offsets / 22 globals |
+| ECMA-335 for `sts2.dll` | **PASS** — 9410 typedefs, 40038 fielddefs, real names resolved |
+| Field values vs independent reader | **PASS** — 11/11 objects, **90/90 field values agreed** |
+| Snapshot lifetime / `Validate()` | **PASS** — bad pointer counted not crashed; disposed → not usable, no throw |
+
+**The descriptor route is confirmed end to end against a live runtime.** That was the central
+architectural bet and it holds.
+
+### 10b.1 The calibration converged — on the wrong width
+
+`FieldDescCalibration` derived `m_dwOffset` as bits `[0,28)` at `+12`. CoreCLR's actual layout is
+`m_dwOffset : 27` then `m_type : 5`. **One bit too wide**, swallowing the low bit of `m_type`.
+
+Measured cost: **7,234 of 23,235 instance fields (31.1%) unreadable** — every non-enum struct
+field, every `double`, every unsigned integer. Any field with an odd `m_type` has bit 27 set, so
+the decode returns `offset + 0x8000000`.
+
+**Why the search did not catch it is the real lesson.** All eight published `System.Exception`
+anchors have *even* `m_type` (CLASS=18, I4=8), so bit 27 is zero in every sample and widths 27 and
+28 reproduce all eight identically. **The anchor set cannot distinguish them.**
+
+> **An anchor set can be insufficient in a way that is invisible from the anchors themselves.**
+> Convergence on a unique candidate proved only that the samples could not tell the difference —
+> not that the answer was right. A bit that is zero across every sample is *absence of evidence*,
+> not evidence the bit belongs to the field, and claiming it is the unsafe direction.
+
+**The root defect** was that the width search kept the *last* matching width per position and
+emitted a single tuple, so 27 and 28 were never two candidates to refuse between — they were
+silently merged into "28". The ambiguity rule had nothing to fire on.
+
+**"Prefer the narrowest" is the wrong fix, and would have been worse than the bug.** An earlier
+revision of this section recommended it. The anchors span offsets 0..100, so the *narrowest*
+matching width is **7 bits** — every field past offset 127 would decode to `real & 0x7F`: a small,
+plausible number comfortably inside `BaseSize`, which the guard cannot catch. That trades a loud
+31% loss for silent corruption of every large object. **Neither direction is derivable from eight
+even-`m_type` samples.**
+
+The fix that works is a **second constraint from real target data**: walk a corpus of real
+`FieldDesc` rows from a module's own type map and count `BaseSize` violations. Take the widest
+width with zero violations — which guards the narrow end, since a truncating width would otherwise
+win — and accept it only if the next bit up is *demonstrably* not ours (excluded by an anchor,
+overflowing `BaseSize` in the corpus, or past the word edge). If neither anchors nor real data can
+separate the two, refuse. **The boundary is observed, never assumed**, and the constant `27`
+appears nowhere in the implementation.
+
+Measured after the fix: **31.1% unreadable → 0%.**
+
+### 10b.2 What held
+
+**The failure was fail-safe.** `RuntimeFieldLayoutSource`'s `BaseSize` guard caught 8/8 broken
+fields, and `offset >= 0x8000000` guarantees it always will. Fields went *missing*; none came back
+**wrong**. That is the property §6.4 was designed around, tested against a real defect rather than
+a hypothetical one.
+
+**And the end-to-end comparison got lucky.** 90/90 agreement was real, but the reference reader
+only surfaces *scalar* fields — so no struct field was ever in the comparison set. The bug was
+found by an independent audit walking every `FieldDesc`, not by the agreement test. A passing
+comparison bounded by the weaker tool's coverage is not the reassurance it appears to be.
 
 ---
 

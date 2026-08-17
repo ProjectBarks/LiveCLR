@@ -81,7 +81,17 @@ public sealed class RuntimeFieldLayoutSource : IClrFieldLayoutSource
 
         // BaseSize is the size of an instance with no elements, so every instance field of a
         // non-array type must fit inside it. A decoded offset that does not is not a field.
-        if (type.BaseSize > 0 && (uint)objectRelative >= type.BaseSize) return false;
+        //
+        // The bound is NOT conditional on having a BaseSize. Live validation showed this guard
+        // is what keeps a mis-derived FieldDesc encoding fail-safe: it caught 8 of 8 broken
+        // fields while the calibrated width was one bit too wide, because a swallowed m_type bit
+        // adds 0x8000000 and no object is that large. A `BaseSize > 0` precondition made that
+        // protection evaporate for exactly the types whose header could not be read — the ones
+        // least worth trusting. An unreadable or zero BaseSize is now a refusal: every object
+        // has at least a method-table pointer, so zero means the read failed or the method table
+        // is not one, and neither is a footing for handing out an offset.
+        if (type.BaseSize <= (uint)_layouts.FirstFieldOffset) return false;
+        if ((uint)objectRelative >= type.BaseSize) return false;
 
         location = new ClrFieldLocation(fieldName, objectRelative, FieldOffsetSource.Runtime);
         return true;

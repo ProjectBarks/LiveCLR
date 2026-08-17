@@ -1,6 +1,7 @@
 namespace LiveClr.Runtime;
 
 using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
 using LiveClr.Cdac;
 using LiveClr.Memory;
 using LiveClr.Metadata;
@@ -16,7 +17,11 @@ using LiveClr.Metadata;
 /// </param>
 /// <param name="OffsetByteOffset">Byte offset of the 32-bit word holding the field offset.</param>
 /// <param name="OffsetBitShift">Right shift applied to that word.</param>
-/// <param name="OffsetBitWidth">Width of the bitfield after shifting.</param>
+/// <param name="OffsetBitWidth">
+/// Width of the bitfield after shifting. Measured against real field descriptors, not inferred
+/// from the anchors — see <see cref="FieldDescCalibration"/> for why the anchors cannot
+/// determine it.
+/// </param>
 /// <param name="EnclosingSlot">
 /// Byte offset of the slot pointing back at the declaring method table, or -1 if it could not
 /// be derived. Used only to validate a lookup, never to produce a value.
@@ -45,8 +50,7 @@ public readonly record struct FieldDescEncoding(
         if (fieldDesc == 0) return false;
         if (!memory.TryRead(fieldDesc + (ulong)OffsetByteOffset, out uint word)) return false;
 
-        uint mask = OffsetBitWidth >= 32 ? uint.MaxValue : (1u << OffsetBitWidth) - 1;
-        offset = (int)((word >> OffsetBitShift) & mask);
+        offset = (int)Decode(word, OffsetBitShift, OffsetBitWidth);
         return true;
     }
 
@@ -66,6 +70,14 @@ public readonly record struct FieldDescEncoding(
 
         return memory.TryReadPointer(slot, out methodTable) && methodTable != 0;
     }
+
+    /// <summary>
+    /// Extract a bitfield from a word. Public because "what would this word decode to at a
+    /// different width?" is the question a diagnostic asks when an offset looks wrong, and it is
+    /// the question that separates a correct width from one bit too many.
+    /// </summary>
+    public static uint Decode(uint word, int shift, int width) =>
+        (word >> shift) & (width >= 32 ? uint.MaxValue : (1u << width) - 1);
 }
 
 /// <summary>
@@ -83,30 +95,51 @@ public readonly record struct FieldDescEncoding(
 /// one level deeper.
 /// </para>
 /// <para>
-/// <b>The technique is §12.5's, applied to the runtime instead of to Godot.</b> That section
-/// derived Godot's offsets by scanning for slots consistent with independently-known values
-/// and intersecting candidate sets across samples. The same move works here because the
-/// descriptor hands us eight independently-known answers: the <c>Exception</c> entry publishes
-/// the object-relative offsets of eight of <c>System.Exception</c>'s MANAGED instance fields
+/// <b>The technique is §12.5's, applied to the runtime instead of to Godot.</b> The descriptor
+/// hands us eight independently-known answers: the <c>Exception</c> entry publishes the
+/// object-relative offsets of eight of <c>System.Exception</c>'s MANAGED instance fields
 /// (<c>_message</c> 16, <c>_innerException</c> 32, <c>_stackTrace</c> 48, <c>_watsonBuckets</c>
 /// 56, <c>_stackTraceString</c> 64, <c>_remoteStackTraceString</c> 72, <c>_xcode</c> 104,
-/// <c>_HResult</c> 108), and <c>ExceptionMethodTable</c> is a published global. So:
-/// resolve those eight fields' <c>FieldDesc</c>s through the published map, then search for
-/// the one bitfield position that reproduces all eight known offsets.
+/// <c>_HResult</c> 108), and <c>ExceptionMethodTable</c> is a published global. Resolve those
+/// eight fields' <c>FieldDesc</c>s through the published map, then search for the bitfield
+/// POSITION — word and shift — that reproduces all eight.
 /// </para>
 /// <para>
-/// <b>Why the failure mode is safe.</b> Convergence requires reproducing eight distinct known
-/// values spanning 0..100 from real target bytes. A wrong guess about the map's flag bits, the
-/// table stride, or the bitfield position does not "mostly work" — it fails to converge and
-/// this class reports <see cref="IsCalibrated"/> false, at which point field resolution
-/// degrades to whatever the caller supplied explicitly. There is no path here that produces a
-/// plausible-but-wrong offset, which is the §12.4e/§7b.1 property that matters.
+/// <b>MEASURED: the anchors pin the position but CANNOT pin the width.</b> Live validation
+/// against CoreCLR 9.0.725.31616 caught this class converging on a 28-bit field where the
+/// runtime's is 27, swallowing the low bit of the neighbouring <c>m_type</c>. The reason is
+/// structural, not incidental: all eight published anchors have an EVEN <c>m_type</c>
+/// (<c>CLASS</c> = 18, <c>I4</c> = 8), so the bit above the offset field is zero in every
+/// single sample. Widths 27 and 28 then reproduce the anchors identically, and there is no
+/// ninth anchor to break the tie — <c>Exception</c> is the only managed type whose field
+/// offsets the descriptor publishes. An earlier version resolved that tie by taking the widest
+/// matching width, which is precisely the unsafe direction: a bit that is zero across every
+/// sample is ABSENCE OF EVIDENCE that it belongs to the field, not evidence that it does.
+/// The measured cost was 7,234 of sts2.dll's 23,235 instance fields — 31%, every non-enum
+/// struct field, every <c>double</c>, every unsigned integer — decoding as
+/// <c>realOffset + 0x8000000</c>.
 /// </para>
 /// <para>
-/// <b>Not live-verified.</b> Everything in §12 was measured against a running game; this was
-/// not. It is exercised in tests against synthesised <c>FieldDesc</c>s using two DIFFERENT
-/// encodings, which proves the search derives rather than recognises a layout, but that is an
-/// argument, not a measurement — the same caveat §12.5 attaches to its own method.
+/// <b>So the width is measured, not preferred.</b> Taking the narrowest instead would be just as
+/// arbitrary and worse: the anchors span 0..100, so the narrowest matching width is 7 bits, and
+/// every field past offset 127 would silently decode wrong — below <c>BaseSize</c>, so nothing
+/// downstream would catch it. Neither direction is derivable from eight samples. Instead, once
+/// the anchors have pinned the position, candidate widths are scored against a CORPUS of real
+/// field descriptors walked out of CoreLib's own <c>TypeDefToMethodTableMap</c>: a decoded
+/// offset must fit inside its declaring type's published <c>MethodTable.BaseSize</c> (§5.2).
+/// A too-wide window fails that on every field whose <c>m_type</c> is odd; the chosen width is
+/// the widest with ZERO violations, and it is accepted only if the next bit up is demonstrably
+/// not ours — either the anchors exclude it, or the corpus does, or the word ends. The boundary
+/// is therefore OBSERVED. Nothing here is a constant: the same walk finds 27 on this runtime and
+/// would find whatever the next one uses.
+/// </para>
+/// <para>
+/// <b>Why the failure mode is safe.</b> Every path that cannot establish both the position and
+/// the boundary reports <see cref="IsCalibrated"/> false, and field resolution then degrades to
+/// whatever the caller supplied explicitly. Live validation confirmed this held even while the
+/// width was wrong: <see cref="RuntimeFieldLayoutSource"/>'s <c>BaseSize</c> guard caught 8 of 8
+/// broken fields, because a swallowed <c>m_type</c> bit adds <c>0x8000000</c> and no object is
+/// that large. Fields went missing; none came back wrong.
 /// </para>
 /// <para>Lifetime: PROCESS tier (§8.8). Calibrate once at attach.</para>
 /// </remarks>
@@ -117,6 +150,15 @@ public sealed class FieldDescCalibration
 
     /// <summary>Below this many agreeing samples the result is not trustworthy enough to use.</summary>
     private const int MinimumSamples = 3;
+
+    /// <summary>Types visited while gathering the width corpus. Bounds a cold-path cost.</summary>
+    private const int MaxCorpusTypes = 512;
+
+    /// <summary>Field descriptors gathered. §12.5's own bar: a few hundred is decisive.</summary>
+    private const int MaxCorpusFields = 1024;
+
+    /// <summary>Below this the corpus cannot separate widths, and the width stays underivable.</summary>
+    private const int MinimumCorpusFields = 8;
 
     /// <summary>
     /// Candidate masks for a lookup-map entry's flag bits (§5.4). Method tables and field
@@ -136,12 +178,20 @@ public sealed class FieldDescCalibration
     /// </remarks>
     private static readonly ulong[] EntryMasks = [~7UL, ~3UL, ~1UL, ulong.MaxValue];
 
-    private FieldDescCalibration(FieldDescEncoding? encoding, int sampleCount, int candidateCount, string detail)
+    private FieldDescCalibration(
+        FieldDescEncoding? encoding,
+        int sampleCount,
+        int candidateCount,
+        string detail,
+        int corpusFields = 0,
+        int corpusViolations = 0)
     {
         Encoding = encoding;
         SampleCount = sampleCount;
         CandidateCount = candidateCount;
         Detail = detail;
+        CorpusFields = corpusFields;
+        CorpusViolations = corpusViolations;
     }
 
     /// <summary>The derived encoding, or null when calibration did not converge.</summary>
@@ -154,12 +204,23 @@ public sealed class FieldDescCalibration
     public int SampleCount { get; }
 
     /// <summary>
-    /// How many distinct bitfield positions satisfied every sample. One is the expected
-    /// answer; more than one is reported rather than silently resolved, because picking
-    /// arbitrarily is exactly the kind of plausible-but-wrong choice this class exists to
-    /// avoid.
+    /// How many distinct bitfield POSITIONS (word and shift) satisfied every anchor. One is the
+    /// expected answer; more than one is reported rather than silently resolved, because picking
+    /// arbitrarily is exactly the kind of plausible-but-wrong choice this class exists to avoid.
+    /// The width is not part of this count — the anchors cannot determine it, so it is measured
+    /// separately against <see cref="CorpusFields"/>.
     /// </summary>
     public int CandidateCount { get; }
+
+    /// <summary>Real field descriptors the width was measured against.</summary>
+    public int CorpusFields { get; }
+
+    /// <summary>
+    /// Corpus fields whose decoded offset does not fit their declaring type's <c>BaseSize</c> at
+    /// the CHOSEN width. Zero on a converged calibration by construction; carried so a caller can
+    /// see the measurement rather than take it on trust.
+    /// </summary>
+    public int CorpusViolations { get; }
 
     /// <summary>Human-readable outcome, suitable for a startup diagnostic.</summary>
     public string Detail { get; }
@@ -235,7 +296,7 @@ public sealed class FieldDescCalibration
                 $"{MinimumSamples} are needed to pin a bitfield position.");
         }
 
-        return Solve(memory, layouts, modulePointer, exceptionMt, samples, corelib.Reader.FieldDefinitions.Count);
+        return Solve(memory, layouts, modulePointer, exceptionMt, corelib, samples);
     }
 
     private static FieldDescCalibration Solve(
@@ -243,10 +304,12 @@ public sealed class FieldDescCalibration
         ClrLayouts layouts,
         ulong modulePointer,
         ulong exceptionMt,
-        List<(int Rid, int ExpectedFieldDescOffset)> samples,
-        int fieldRowCount)
+        ModuleMetadata corelib,
+        List<(int Rid, int ExpectedFieldDescOffset)> samples)
     {
         ulong mapAddress = modulePointer + (ulong)layouts.ModuleFieldDefMapOffset;
+        int fieldRowCount = corelib.Reader.FieldDefinitions.Count;
+
         FieldDescCalibration? ambiguous = null;
 
         // A mask under which the back-pointer could NOT be derived is held back rather than
@@ -257,6 +320,7 @@ public sealed class FieldDescCalibration
         // because a runtime that stores the declaring type somewhere this search cannot see is a
         // §5.5 gap, not a fault — refusing outright would trade a working degraded mode for none.
         FieldDescCalibration? unvalidated = null;
+        FieldDescCalibration? unmeasured = null;
 
         foreach (ulong entryMask in EntryMasks)
         {
@@ -278,26 +342,52 @@ public sealed class FieldDescCalibration
 
             if (descriptors.Count < MinimumSamples) continue;
 
-            List<(int ByteOffset, int Shift, int Width)> candidates = FindOffsetBitfields(descriptors);
-            if (candidates.Count == 0) continue;
+            List<OffsetPosition> positions = FindOffsetPositions(descriptors);
+            if (positions.Count == 0) continue;
 
-            (int byteOffset, int shift, int width) = candidates[0];
-            (int enclosingSlot, bool enclosingRelative) = FindEnclosingSlot(descriptors, exceptionMt, layouts.PointerSize);
-
-            var encoding = new FieldDescEncoding(
-                entryMask, byteOffset, shift, width, enclosingSlot, enclosingRelative);
-
-            if (candidates.Count > 1)
+            if (positions.Count > 1)
             {
                 // Ambiguity under one mask does not condemn the others; record it and keep
                 // going, but never resolve it by picking — that is the plausible-but-wrong
                 // outcome this whole class exists to avoid.
                 ambiguous ??= new FieldDescCalibration(
-                    null, descriptors.Count, candidates.Count,
-                    $"ambiguous under entry mask 0x{entryMask:X}: {candidates.Count} bitfield positions " +
+                    null, descriptors.Count, positions.Count,
+                    $"ambiguous under entry mask 0x{entryMask:X}: {positions.Count} bitfield positions " +
                     $"reproduce all {descriptors.Count} known offsets, so none is trustworthy.");
                 continue;
             }
+
+            OffsetPosition position = positions[0];
+            (int enclosingSlot, bool enclosingRelative) = FindEnclosingSlot(descriptors, exceptionMt, layouts.PointerSize);
+
+            List<CorpusField> corpus = CollectCorpus(
+                memory, layouts, modulePointer, corelib, entryMask, position.ByteOffset, enclosingSlot, enclosingRelative);
+
+            if (corpus.Count < MinimumCorpusFields)
+            {
+                unmeasured ??= new FieldDescCalibration(
+                    null, descriptors.Count, 1,
+                    $"the offset field sits at +{position.ByteOffset} shifted {position.ShiftBits}, but only " +
+                    $"{corpus.Count} real field descriptors could be walked out of CoreLib — too few to measure " +
+                    "the field's WIDTH. The eight published anchors all have an even m_type, so they cannot " +
+                    "distinguish a width from a wider one (see the type remarks).",
+                    corpus.Count);
+                continue;
+            }
+
+            if (!TryMeasureWidth(corpus, position, layouts.FirstFieldOffset, out int width, out string boundary))
+            {
+                unmeasured ??= new FieldDescCalibration(
+                    null, descriptors.Count, 1,
+                    $"the offset field sits at +{position.ByteOffset} shifted {position.ShiftBits}, but no width " +
+                    $"the anchors permit decodes all {corpus.Count} sampled field descriptors inside their own " +
+                    "BaseSize, so the field's width could not be measured.",
+                    corpus.Count);
+                continue;
+            }
+
+            var encoding = new FieldDescEncoding(
+                entryMask, position.ByteOffset, position.ShiftBits, width, enclosingSlot, enclosingRelative);
 
             string enclosing = enclosingSlot < 0
                 ? "no back-pointer slot derived (lookups are then bounded only by BaseSize)"
@@ -307,8 +397,10 @@ public sealed class FieldDescCalibration
                 encoding,
                 descriptors.Count,
                 1,
-                $"derived from {descriptors.Count} System.Exception fields: offset at +{byteOffset} " +
-                $"bits [{shift}, {shift + width}), entry mask 0x{entryMask:X}, {enclosing}.");
+                $"derived from {descriptors.Count} System.Exception anchors: offset at +{position.ByteOffset} " +
+                $"bits [{position.ShiftBits}, {position.ShiftBits + width}), entry mask 0x{entryMask:X}, {enclosing}. " +
+                $"Width measured against {corpus.Count} real field descriptors ({boundary}).",
+                corpus.Count);
 
             if (enclosingSlot >= 0) return converged;
 
@@ -317,43 +409,248 @@ public sealed class FieldDescCalibration
 
         // A unique convergence under some mask is stronger evidence than an ambiguity under
         // another, so the held-back result outranks it.
-        return unvalidated ?? ambiguous ?? new FieldDescCalibration(
+        return unvalidated ?? ambiguous ?? unmeasured ?? new FieldDescCalibration(
             null, samples.Count, 0,
             "no bitfield position in the first 64 bytes of a FieldDesc reproduces the published " +
             "System.Exception offsets; FieldDefToDescMap may be segmented past its first block, " +
             "or this runtime stores field offsets somewhere else entirely.");
     }
 
+    /// <summary>A word and shift the anchors agree on, plus every width they leave possible.</summary>
+    /// <param name="ByteOffset">Byte offset of the 32-bit word within the <c>FieldDesc</c>.</param>
+    /// <param name="ShiftBits">Right shift applied to it.</param>
+    /// <param name="Widths">Widths that reproduce every anchor, ascending. Never empty.</param>
+    private readonly record struct OffsetPosition(int ByteOffset, int ShiftBits, IReadOnlyList<int> Widths);
+
+    /// <summary>One real field descriptor, reduced to what scoring a width needs.</summary>
+    /// <param name="Word">The 32-bit word at the position the anchors pinned.</param>
+    /// <param name="BaseSize">Published <c>MethodTable.BaseSize</c> of the declaring type.</param>
+    private readonly record struct CorpusField(uint Word, uint BaseSize);
+
     /// <summary>
-    /// Every (word, shift, width) that decodes ALL samples to their known offsets.
+    /// Every (word, shift) that decodes ALL anchors correctly at SOME width, with the widths
+    /// listed rather than collapsed.
     /// </summary>
     /// <remarks>
-    /// Width is grown to the widest that still satisfies every sample, which finds the real
-    /// bitfield boundary: a neighbouring bitfield with any bit set in any sample stops the
-    /// growth. Taking the minimum width instead would truncate offsets larger than the samples
-    /// happened to cover.
+    /// The previous version returned one entry per position carrying the widest matching width.
+    /// That silently resolved the tie the anchors cannot resolve, and it is the defect live
+    /// validation caught: 27 and 28 both reproduce all eight anchors, and 28 was returned. The
+    /// widths are now carried out intact so the choice is made by something that can actually
+    /// see the difference.
     /// </remarks>
-    private static List<(int ByteOffset, int Shift, int Width)> FindOffsetBitfields(
+    private static List<OffsetPosition> FindOffsetPositions(
         List<(ulong Address, byte[] Bytes, int Expected)> descriptors)
     {
-        var results = new List<(int, int, int)>();
+        var results = new List<OffsetPosition>();
 
         for (int byteOffset = 0; byteOffset + 4 <= SearchWindow; byteOffset += 4)
         {
             for (int shift = 0; shift < 32; shift++)
             {
-                int width = 0;
-                for (int candidateWidth = 1; candidateWidth <= 32 - shift; candidateWidth++)
+                var widths = new List<int>();
+                for (int width = 1; width <= 32 - shift; width++)
                 {
-                    if (Matches(descriptors, byteOffset, shift, candidateWidth)) width = candidateWidth;
-                    else if (width > 0) break;
+                    if (Matches(descriptors, byteOffset, shift, width)) widths.Add(width);
                 }
 
-                if (width > 0) results.Add((byteOffset, shift, width));
+                if (widths.Count > 0) results.Add(new OffsetPosition(byteOffset, shift, widths));
             }
         }
 
         return results;
+    }
+
+    /// <summary>
+    /// Choose the width by measurement: the widest the anchors permit that decodes every sampled
+    /// field descriptor inside its own type's <c>BaseSize</c>, accepted only if the next bit up
+    /// is demonstrably NOT part of the field.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// "Widest with zero violations" and "boundary observed" pull in opposite directions on
+    /// purpose. Widest guards the narrow end: the anchors span 0..100, so widths from 7 upward
+    /// all satisfy them, and any of those below the true width would truncate real offsets into
+    /// small plausible values that no downstream check could catch. The boundary requirement
+    /// guards the wide end: the chosen width is only accepted when the next bit is excluded by
+    /// the anchors, excluded by the corpus, or does not exist. Between them the width is pinned
+    /// by evidence at both ends rather than by preference at either.
+    /// </para>
+    /// </remarks>
+    private static bool TryMeasureWidth(
+        List<CorpusField> corpus, OffsetPosition position, int firstFieldOffset, out int width, out string boundary)
+    {
+        width = 0;
+        boundary = string.Empty;
+
+        for (int i = position.Widths.Count - 1; i >= 0; i--)
+        {
+            int candidate = position.Widths[i];
+            if (CountViolations(corpus, position.ShiftBits, candidate, firstFieldOffset) != 0) continue;
+
+            int next = candidate + 1;
+            if (next > 32 - position.ShiftBits)
+            {
+                width = candidate;
+                boundary = "the field ends at the word boundary";
+                return true;
+            }
+
+            // The anchors already exclude the next bit: they decoded correctly at `candidate`
+            // and not at `next`, which only happens if some anchor has that bit set.
+            if (!position.Widths.Contains(next))
+            {
+                width = candidate;
+                boundary = $"bit {position.ShiftBits + candidate} is set in an anchor, so it is not part of the field";
+                return true;
+            }
+
+            int violationsAbove = CountViolations(corpus, position.ShiftBits, next, firstFieldOffset);
+            if (violationsAbove > 0)
+            {
+                width = candidate;
+                boundary =
+                    $"widening to {next} bits overflows BaseSize on {violationsAbove} of {corpus.Count} of them, " +
+                    $"so bit {position.ShiftBits + candidate} belongs to the neighbouring field";
+                return true;
+            }
+
+            // Neither the anchors nor real data can tell this bit apart from the field's own.
+            // Claiming it is the unsafe direction, and that is the whole finding here.
+            return false;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Field descriptors whose decoded offset does not fit inside their declaring type.
+    /// </summary>
+    /// <remarks>
+    /// <c>MethodTable.BaseSize</c> (§5.2) is the size of an instance with no elements, so every
+    /// instance field must lie inside it. A window one bit too wide picks up the low bit of the
+    /// element type, which adds <c>2^(shift+width-1)</c> — vastly past any object — so a wrong
+    /// width does not produce a subtly wrong number here, it produces an impossible one.
+    /// </remarks>
+    private static int CountViolations(List<CorpusField> corpus, int shift, int width, int firstFieldOffset)
+    {
+        int violations = 0;
+        foreach (CorpusField field in corpus)
+        {
+            long objectRelative = FieldDescEncoding.Decode(field.Word, shift, width) + (long)firstFieldOffset;
+            if (objectRelative >= field.BaseSize) violations++;
+        }
+
+        return violations;
+    }
+
+    /// <summary>
+    /// Walks CoreLib's own loaded types for real field descriptors to measure a width against.
+    /// </summary>
+    /// <remarks>
+    /// Self-validating target data, not a constant: every type is reached through
+    /// <c>Module.TypeDefToMethodTableMap</c> and kept only if its <c>MethodTable.Module</c> points
+    /// back at the module we came from, and every field descriptor is kept only if its
+    /// back-pointer agrees too. Types are visited in rid order and the walk stops as soon as it
+    /// has enough — this runs once, at attach, on the cold path.
+    /// </remarks>
+    private static List<CorpusField> CollectCorpus(
+        IMemoryReader memory,
+        ClrLayouts layouts,
+        ulong modulePointer,
+        ModuleMetadata corelib,
+        ulong entryMask,
+        int byteOffset,
+        int enclosingSlot,
+        bool enclosingRelative)
+    {
+        var corpus = new List<CorpusField>();
+
+        ulong typeMap = modulePointer + (ulong)layouts.ModuleTypeDefMapOffset;
+        ulong fieldMap = modulePointer + (ulong)layouts.ModuleFieldDefMapOffset;
+
+        if (!memory.TryReadPointer(typeMap + (ulong)layouts.LookupMapTableDataOffset, out ulong table) || table == 0)
+        {
+            return corpus;
+        }
+
+        int stride = layouts.PointerSize;
+        int typeCount = corelib.Reader.TypeDefinitions.Count;
+        int fieldRowCount = corelib.Reader.FieldDefinitions.Count;
+        var raw = new byte[Math.Max(4096 / stride, 1) * stride];
+        int types = 0;
+
+        for (int first = 1; first <= typeCount && corpus.Count < MaxCorpusFields && types < MaxCorpusTypes;)
+        {
+            ulong address = table + ((ulong)first * (ulong)stride);
+
+            // Clipped to a page, so an unmapped one costs only the rids it holds.
+            int count = ClrLayouts.EntriesWithinPage(address, stride, typeCount - first + 1);
+            int scanned = count;
+
+            if (!memory.TryRead(address, raw.AsSpan(0, count * stride)))
+            {
+                first += scanned;
+                continue;
+            }
+
+            for (int i = 0; i < count && corpus.Count < MaxCorpusFields && types < MaxCorpusTypes; i++)
+            {
+                ulong methodTable = (stride == 8 ? BitConverter.ToUInt64(raw, i * 8) : BitConverter.ToUInt32(raw, i * 4)) & ~7UL;
+                if (methodTable == 0) continue;
+
+                // Only believe a method table that claims the module we walked it out of.
+                if (!memory.TryReadPointer(methodTable + (ulong)layouts.MethodTableModuleOffset, out ulong owner)) continue;
+                if (owner != modulePointer) continue;
+                if (!memory.TryRead(methodTable + (ulong)layouts.MethodTableBaseSizeOffset, out uint baseSize)) continue;
+                if (baseSize <= (uint)layouts.FirstFieldOffset) continue;
+
+                types++;
+                TypeDefinitionHandle handle = MetadataTokens.TypeDefinitionHandle(first + i);
+
+                foreach (MetadataField field in corelib.Types.GetFields(handle))
+                {
+                    if (corpus.Count >= MaxCorpusFields) break;
+                    if (field.IsStatic || field.IsLiteral) continue;
+
+                    int rid = field.Token & 0x00FF_FFFF;
+                    if (!layouts.TryGetLookupMapSlot(memory, fieldMap, rid, fieldRowCount, out ulong slot)) continue;
+                    if (!memory.TryReadPointer(slot, out ulong entry)) continue;
+
+                    ulong fieldDesc = entry & entryMask;
+                    if (fieldDesc == 0) continue;
+                    if (!IsDeclaredBy(memory, layouts, fieldDesc, enclosingSlot, enclosingRelative, modulePointer)) continue;
+                    if (!memory.TryRead(fieldDesc + (ulong)byteOffset, out uint word)) continue;
+
+                    corpus.Add(new CorpusField(word, baseSize));
+                }
+            }
+
+            first += scanned;
+        }
+
+        return corpus;
+    }
+
+    /// <summary>
+    /// Whether a candidate <c>FieldDesc</c> really belongs to the module being walked. Compared
+    /// at module granularity because a generic instantiation's fields are described by the
+    /// canonical type's descriptors, not the instantiation's.
+    /// </summary>
+    private static bool IsDeclaredBy(
+        IMemoryReader memory,
+        ClrLayouts layouts,
+        ulong fieldDesc,
+        int enclosingSlot,
+        bool enclosingRelative,
+        ulong modulePointer)
+    {
+        if (enclosingSlot < 0) return true;
+
+        var probe = new FieldDescEncoding(0, 0, 0, 0, enclosingSlot, enclosingRelative);
+        if (!probe.TryReadEnclosingMethodTable(memory, fieldDesc, out ulong enclosing)) return false;
+
+        return memory.TryReadPointer(enclosing + (ulong)layouts.MethodTableModuleOffset, out ulong owner)
+            && owner == modulePointer;
     }
 
     private static bool Matches(
@@ -362,12 +659,10 @@ public sealed class FieldDescCalibration
         int shift,
         int width)
     {
-        uint mask = width >= 32 ? uint.MaxValue : (1u << width) - 1;
-
         foreach ((_, byte[] bytes, int expected) in descriptors)
         {
             uint word = BitConverter.ToUInt32(bytes, byteOffset);
-            if (((word >> shift) & mask) != (uint)expected) return false;
+            if (FieldDescEncoding.Decode(word, shift, width) != (uint)expected) return false;
         }
 
         return true;

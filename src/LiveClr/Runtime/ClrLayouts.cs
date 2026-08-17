@@ -240,6 +240,28 @@ public sealed class ClrLayouts
     }
 
     /// <summary>
+    /// How many <paramref name="stride"/>-sized entries starting at <paramref name="address"/>
+    /// lie within the same 4 KiB page.
+    /// </summary>
+    /// <remarks>
+    /// Readability is decided per page, and a bulk read is all-or-nothing, so a read that spans
+    /// a page boundary fails whenever EITHER page is missing. Clipping every read to one page
+    /// makes an unmapped page cost exactly the entries on it — which is what lets a table walk
+    /// lose a hole rather than the whole table.
+    /// </remarks>
+    internal static int EntriesWithinPage(ulong address, int stride, int remaining)
+    {
+        const int PageSize = 4096;
+
+        int toPageEnd = PageSize - (int)(address % PageSize);
+        int entries = toPageEnd / stride;
+
+        // A stride straddling the boundary cannot be clipped; read the one entry and let it fail
+        // on its own if the next page is missing.
+        return Math.Clamp(entries == 0 ? 1 : entries, 1, remaining);
+    }
+
+    /// <summary>
     /// Read an object's method table, with the flag bits removed (§12.4d).
     /// </summary>
     public bool TryReadMethodTableOf(IMemoryReader memory, ulong objectAddress, out ulong methodTable)

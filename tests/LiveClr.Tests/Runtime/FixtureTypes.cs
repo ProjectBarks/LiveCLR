@@ -12,6 +12,22 @@ namespace LiveClr.Tests.Runtime;
 // read fields by the names a caller would actually write.
 #pragma warning disable CA1051, CS0649, IDE0044
 
+/// <summary>An inline value type, so a struct-typed field exists to read.</summary>
+/// <remarks>
+/// Live validation found this blind spot: the independent reader used to cross-check field
+/// values only surfaces scalars, so no struct-typed field was ever in the comparison set — and
+/// a struct field is exactly what a one-bit-too-wide FieldDesc decode breaks, because
+/// <c>ELEMENT_TYPE_VALUETYPE</c> is 17 and odd.
+/// </remarks>
+internal struct FixturePoint
+{
+    /// <summary>First component.</summary>
+    public int X;
+
+    /// <summary>Second component.</summary>
+    public int Y;
+}
+
 /// <summary>A base class, so inheritance has something to walk.</summary>
 internal class FixtureBase
 {
@@ -19,7 +35,7 @@ internal class FixtureBase
     public int Hp;
 }
 
-/// <summary>A derived class with a string and a reference field.</summary>
+/// <summary>A derived class with a string, a reference and an inline struct field.</summary>
 internal class FixtureDerived : FixtureBase
 {
     /// <summary>Exercises the §5.2 string decode.</summary>
@@ -27,6 +43,9 @@ internal class FixtureDerived : FixtureBase
 
     /// <summary>Exercises following a reference to another object.</summary>
     public FixtureBase? Link;
+
+    /// <summary>Inline, not a reference — and an odd <c>m_type</c>, which is the point.</summary>
+    public FixturePoint Position;
 }
 
 /// <summary>Holds the collections, plus a static root to resolve from.</summary>

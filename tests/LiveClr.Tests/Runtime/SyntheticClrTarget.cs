@@ -403,8 +403,13 @@ internal sealed class SyntheticClrTarget : IDisposable
         _listCanonicalMethodTable = DefineType(
             CoreLibModulePointer, metadata, "System.Collections.Generic.List`1", _objectMethodTable, 32, 0, ClrElementType.Class);
 
-        DefineFieldDesc(CoreLibModulePointer, metadata, "System.Collections.Generic.List`1", "_items", _listCanonicalMethodTable, 8);
-        DefineFieldDesc(CoreLibModulePointer, metadata, "System.Collections.Generic.List`1", "_size", _listCanonicalMethodTable, 16);
+        DefineFieldDesc(CoreLibModulePointer, metadata, "System.Collections.Generic.List`1", "_items", _listCanonicalMethodTable, 8, 29);
+        DefineFieldDesc(CoreLibModulePointer, metadata, "System.Collections.Generic.List`1", "_size", _listCanonicalMethodTable, 16, 8);
+
+        // System.String's own fields, at the offsets §5.2 publishes for them. _firstChar is a
+        // Char (3, odd) — more real data for the width measurement.
+        DefineFieldDesc(CoreLibModulePointer, metadata, "System.String", "_stringLength", _stringMethodTable, StringLength, 8);
+        DefineFieldDesc(CoreLibModulePointer, metadata, "System.String", "_firstChar", _stringMethodTable, StringFirstChar, 3);
     }
 
     private void DefineExceptionFieldDescs(ModuleMetadata metadata, ulong exceptionMethodTable)
@@ -413,18 +418,46 @@ internal sealed class SyntheticClrTarget : IDisposable
             ?? throw new InvalidOperationException("CoreLib defines no System.Exception.");
 
         PublishedExceptionFields = 0;
+        int filler = 0;
+
         foreach (MetadataField field in metadata.Types.GetFields(handle))
         {
             if (field.IsStatic || field.IsLiteral) continue;
-            if (!ExceptionOffsets.TryGetValue(field.Name, out int objectRelative)) continue;
-            if (PublishedExceptionFields >= _options.ExceptionFieldLimit) break;
 
-            // One field stored where the descriptor says it is not: no single bitfield position
-            // can then reproduce every published offset, which must end in refusal.
-            bool corrupt = _options.CorruptOneExceptionOffset && PublishedExceptionFields == 1;
+            if (ExceptionOffsets.TryGetValue(field.Name, out (int Offset, int ElementType) published))
+            {
+                if (PublishedExceptionFields >= _options.ExceptionFieldLimit) continue;
 
-            WriteFieldDesc(CoreLibModulePointer, field.Token, exceptionMethodTable, corrupt ? objectRelative + 4 : objectRelative);
-            PublishedExceptionFields++;
+                // One field stored where the descriptor says it is not: no single bitfield
+                // position can then reproduce every published offset, which must end in refusal.
+                bool corrupt = _options.CorruptOneExceptionOffset && PublishedExceptionFields == 1;
+
+                WriteFieldDesc(
+                    CoreLibModulePointer,
+                    field.Token,
+                    exceptionMethodTable,
+                    corrupt ? published.Offset + 4 : published.Offset,
+                    published.ElementType);
+
+                PublishedExceptionFields++;
+                continue;
+            }
+
+            // System.Exception's REMAINING instance fields. They are not anchors — the descriptor
+            // says nothing about them — but they are exactly what the width measurement needs:
+            // real descriptors with ODD element types, which the eight published anchors never
+            // have. Offsets are synthetic but distinct and inside BaseSize, which is all the
+            // BaseSize test requires of them.
+            if (filler >= FillerOffsets.Length) continue;
+
+            WriteFieldDesc(
+                CoreLibModulePointer,
+                field.Token,
+                exceptionMethodTable,
+                FillerOffsets[filler] + ObjectHeaderSize,
+                OddElementTypes[filler % OddElementTypes.Length]);
+
+            filler++;
         }
     }
 
@@ -432,36 +465,59 @@ internal sealed class SyntheticClrTarget : IDisposable
     public int PublishedExceptionFields { get; private set; }
 
     /// <summary>
-    /// The <c>Exception</c> offsets the shipped descriptor publishes (§5.2). Written into the
-    /// fixture verbatim so that a calibrator reading them back reproduces the same numbers.
+    /// The <c>Exception</c> offsets the shipped descriptor publishes (§5.2), with the element
+    /// type CoreCLR stores beside each.
     /// </summary>
-    private static readonly Dictionary<string, int> ExceptionOffsets = new(StringComparer.Ordinal)
-    {
-        ["_message"] = 16,
-        ["_innerException"] = 32,
-        ["_stackTrace"] = 48,
-        ["_watsonBuckets"] = 56,
-        ["_stackTraceString"] = 64,
-        ["_remoteStackTraceString"] = 72,
-        ["_xcode"] = 104,
-        ["_HResult"] = 108,
-    };
+    /// <remarks>
+    /// <b>Every one of these element types is EVEN, and that is the whole point.</b> Live
+    /// validation traced a wrong calibrated width to exactly this: with <c>CLASS</c> = 18 and
+    /// <c>I4</c> = 8, the bit directly above the offset field is zero in all eight anchors, so
+    /// they cannot distinguish the true width from one bit wider. The fixture reproduces that
+    /// blind spot faithfully rather than papering over it — a calibrator that only works because
+    /// the fixture happened to include an odd anchor would be proving nothing.
+    /// </remarks>
+    private static readonly Dictionary<string, (int Offset, int ElementType)> ExceptionOffsets =
+        new(StringComparer.Ordinal)
+        {
+            ["_message"] = (16, 18),
+            ["_innerException"] = (32, 18),
+            ["_stackTrace"] = (48, 18),
+            ["_watsonBuckets"] = (56, 18),
+            ["_stackTraceString"] = (64, 18),
+            ["_remoteStackTraceString"] = (72, 18),
+            ["_xcode"] = (104, 8),
+            ["_HResult"] = (108, 8),
+        };
+
+    /// <summary>Slots inside <c>System.Exception</c>'s BaseSize that the published fields do not use.</summary>
+    private static readonly int[] FillerOffsets = [0, 4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84];
+
+    /// <summary>
+    /// <c>Char</c>, <c>U1</c>, <c>U2</c>, <c>U4</c>, <c>U8</c>, <c>R8</c>, <c>VALUETYPE</c>,
+    /// <c>SZARRAY</c> — the odd element types whose low bit a too-wide offset window swallows.
+    /// </summary>
+    private static readonly int[] OddElementTypes = [3, 5, 7, 9, 11, 13, 17, 29];
 
     // ---------------------------------------------------------------- app types and heap
 
     private void DefineAppTypes(ModuleMetadata app)
     {
         ulong baseMt = DefineType(AppModulePointer, app, typeof(FixtureBase).FullName!, _objectMethodTable, 24, 0, ClrElementType.Class);
-        ulong derivedMt = DefineType(AppModulePointer, app, typeof(FixtureDerived).FullName!, baseMt, 32, 0, ClrElementType.Class);
+        ulong derivedMt = DefineType(AppModulePointer, app, typeof(FixtureDerived).FullName!, baseMt, 48, 0, ClrElementType.Class);
         ulong holderMt = DefineType(AppModulePointer, app, typeof(FixtureHolder).FullName!, _objectMethodTable, 24, 0, ClrElementType.Class);
 
         DerivedMethodTable = derivedMt;
 
-        DefineFieldDesc(AppModulePointer, app, typeof(FixtureBase).FullName!, nameof(FixtureBase.Hp), baseMt, 8);
-        DefineFieldDesc(AppModulePointer, app, typeof(FixtureDerived).FullName!, nameof(FixtureDerived.Name), derivedMt, 16);
-        DefineFieldDesc(AppModulePointer, app, typeof(FixtureDerived).FullName!, nameof(FixtureDerived.Link), derivedMt, 24);
-        DefineFieldDesc(AppModulePointer, app, typeof(FixtureHolder).FullName!, nameof(FixtureHolder.Items), holderMt, 8);
-        DefineFieldDesc(AppModulePointer, app, typeof(FixtureHolder).FullName!, nameof(FixtureHolder.Numbers), holderMt, 16);
+        // Element types are per field, exactly as the runtime stores them. Note Numbers (SZARRAY
+        // 29) and Position (VALUETYPE 17) are ODD: a FieldDesc window one bit too wide decodes
+        // both as offset + 0x8000000, so these two fields are a live regression guard for the
+        // width the calibration derives.
+        DefineFieldDesc(AppModulePointer, app, typeof(FixtureBase).FullName!, nameof(FixtureBase.Hp), baseMt, 8, 8);
+        DefineFieldDesc(AppModulePointer, app, typeof(FixtureDerived).FullName!, nameof(FixtureDerived.Name), derivedMt, 16, 14);
+        DefineFieldDesc(AppModulePointer, app, typeof(FixtureDerived).FullName!, nameof(FixtureDerived.Link), derivedMt, 24, 18);
+        DefineFieldDesc(AppModulePointer, app, typeof(FixtureDerived).FullName!, nameof(FixtureDerived.Position), derivedMt, 32, 17);
+        DefineFieldDesc(AppModulePointer, app, typeof(FixtureHolder).FullName!, nameof(FixtureHolder.Items), holderMt, 8, 18);
+        DefineFieldDesc(AppModulePointer, app, typeof(FixtureHolder).FullName!, nameof(FixtureHolder.Numbers), holderMt, 16, 29);
 
         ulong derivedArrayMt = DefineArrayType(CoreLibModulePointer, _objectMethodTable, 8, derivedMt);
         ulong intArrayMt = DefineArrayType(CoreLibModulePointer, _objectMethodTable, 4, 0);
@@ -497,11 +553,15 @@ internal sealed class SyntheticClrTarget : IDisposable
 
     private ulong DefineDerived(ulong methodTable, int hp, ulong name, ulong link)
     {
-        ulong obj = Alloc(32);
+        ulong obj = Alloc(48);
         _builder.WriteU64(obj, methodTable);
         _builder.WriteI32(obj + 8, hp);
         _builder.WriteU64(obj + 16, name);
         _builder.WriteU64(obj + 24, link);
+
+        // Inline struct, stored in place rather than behind a reference.
+        _builder.WriteI32(obj + 32, hp * 2);
+        _builder.WriteI32(obj + 36, hp * 3);
         return obj;
     }
 
@@ -622,7 +682,13 @@ internal sealed class SyntheticClrTarget : IDisposable
     }
 
     private void DefineFieldDesc(
-        ulong modulePointer, ModuleMetadata metadata, string typeName, string fieldName, ulong enclosing, int objectRelativeOffset)
+        ulong modulePointer,
+        ModuleMetadata metadata,
+        string typeName,
+        string fieldName,
+        ulong enclosing,
+        int objectRelativeOffset,
+        int elementType)
     {
         TypeDefinitionHandle handle = metadata.Types.ResolveType(typeName)
             ?? throw new InvalidOperationException($"the fixture's metadata defines no '{typeName}'.");
@@ -632,13 +698,23 @@ internal sealed class SyntheticClrTarget : IDisposable
             throw new InvalidOperationException($"'{typeName}' declares no field '{fieldName}'.");
         }
 
-        WriteFieldDesc(modulePointer, field.Token, enclosing, objectRelativeOffset);
+        WriteFieldDesc(modulePointer, field.Token, enclosing, objectRelativeOffset, elementType);
     }
 
-    private void WriteFieldDesc(ulong modulePointer, int token, ulong enclosing, int objectRelativeOffset)
+    /// <summary>
+    /// Lay down one <c>FieldDesc</c>, packing the offset next to a per-field element type.
+    /// </summary>
+    /// <remarks>
+    /// The element type is a PARAMETER rather than a constant because the entire width question
+    /// turns on its low bit. A fixture that stamped one element type on every descriptor could
+    /// no more distinguish a correct width from a wider one than the anchors can — which is
+    /// precisely the hole live validation fell through.
+    /// </remarks>
+    private void WriteFieldDesc(ulong modulePointer, int token, ulong enclosing, int objectRelativeOffset, int elementType)
     {
         ulong fieldDesc = Alloc(FieldDescStride);
         int stored = objectRelativeOffset - ObjectHeaderSize;
+        uint type = (uint)elementType & 0x1F;
 
         switch (Style)
         {
@@ -646,15 +722,15 @@ internal sealed class SyntheticClrTarget : IDisposable
                 _builder.WriteU64(fieldDesc, enclosing);
                 _builder.WriteU32(fieldDesc + 8, (uint)(token & 0x00FF_FFFF));
 
-                // Offset in the low 27 bits, a non-zero element type above it so the calibrator
-                // has a real bitfield boundary to find rather than a word of zeroes.
-                _builder.WriteU32(fieldDesc + 12, (uint)stored | (0x12u << 27));
+                // Offset in the low 27 bits, element type in the 5 above — CoreCLR's own packing,
+                // so the boundary the calibration has to find is a real one.
+                _builder.WriteU32(fieldDesc + 12, (uint)stored | (type << 27));
                 break;
 
             case FieldDescStyle.Alternate:
                 _builder.WriteI32(fieldDesc + 8, checked((int)((long)enclosing - (long)(fieldDesc + 8))));
                 _builder.WriteU32(fieldDesc + 16, (uint)(token & 0x00FF_FFFF));
-                _builder.WriteU32(fieldDesc + 20, ((uint)stored << 5) | 0x1F);
+                _builder.WriteU32(fieldDesc + 20, ((uint)stored << 5) | type);
                 break;
 
             default:

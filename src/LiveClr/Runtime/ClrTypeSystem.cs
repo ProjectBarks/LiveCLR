@@ -130,17 +130,20 @@ public sealed class ClrModuleInfo
 
         if (memory.TryReadPointer(mapAddress + (ulong)_layouts.LookupMapTableDataOffset, out ulong table) && table != 0)
         {
-            int perChunk = Math.Max(MapChunkBytes / stride, 1);
-            var raw = new byte[perChunk * stride];
+            var raw = new byte[Math.Max(MapChunkBytes / stride, 1) * stride];
 
-            for (int first = 1; first <= typeCount; first += perChunk)
+            for (int first = 1; first <= typeCount;)
             {
-                int count = Math.Min(perChunk, typeCount - first + 1);
+                ulong address = table + ((ulong)first * (ulong)stride);
+
+                // Clipped to a page so one unmapped page costs exactly the rids on it.
+                int count = ClrLayouts.EntriesWithinPage(address, stride, typeCount - first + 1);
                 Span<byte> block = raw.AsSpan(0, count * stride);
 
-                if (!memory.TryRead(table + ((ulong)first * (ulong)stride), block))
+                if (!memory.TryRead(address, block))
                 {
                     gaps++;
+                    first += count;
                     continue;
                 }
 
@@ -159,6 +162,8 @@ public sealed class ClrModuleInfo
                     byRid[rid] = methodTable;
                     byMethodTable.TryAdd(methodTable, rid);
                 }
+
+                first += count;
             }
         }
 

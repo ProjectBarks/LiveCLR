@@ -34,6 +34,67 @@ public sealed class FieldDescCalibrationTests
         FieldDescEncoding encoding = calibration.Encoding!.Value;
         Assert.Equal(expectedWord, encoding.OffsetByteOffset);
         Assert.Equal(expectedShift, encoding.OffsetBitShift);
+
+        // 27 bits of offset, 5 of element type — the layout live validation measured on
+        // CoreCLR 9.0.725.31616. Both fixture encodings pack it the same way, and neither
+        // number is written down anywhere in the production code.
+        Assert.Equal(27, encoding.OffsetBitWidth);
+        Assert.Equal(0, calibration.CorpusViolations);
+        Assert.True(calibration.CorpusFields >= 8, $"corpus too small: {calibration.Detail}");
+    }
+
+    [Fact]
+    public void TheAnchorsAloneCannotChooseTheWidthSoTheCorpusDoes()
+    {
+        // The measured defect, pinned. Every offset the descriptor publishes for
+        // System.Exception has an EVEN element type, so the bit above the offset field is zero
+        // in all eight anchors and widths 27 AND 28 reproduce them identically. Nothing in the
+        // anchors can separate the two; the earlier version resolved the tie by taking the wider
+        // one and silently broke 31% of a real assembly's instance fields.
+        using SyntheticClrTarget target = SyntheticClrTarget.Build();
+        using LiveProcess process = target.Attach();
+
+        FieldDescEncoding encoding = process.FieldDescCalibration.Encoding!.Value;
+
+        // Confirm the ambiguity is real in this fixture: decoding an anchor at 28 bits gives the
+        // same answer as at 27, so the anchor evidence genuinely does not distinguish them.
+        const uint AnchorWord = 8u | (18u << 27);       // _message: offset 8, ELEMENT_TYPE_CLASS
+        Assert.Equal(8u, FieldDescEncoding.Decode(AnchorWord, 0, 27));
+        Assert.Equal(8u, FieldDescEncoding.Decode(AnchorWord, 0, 28));
+
+        // And confirm the corpus can: an ODD element type sets bit 27, which 28 swallows.
+        const uint OddWord = 8u | (17u << 27);          // a struct field, ELEMENT_TYPE_VALUETYPE
+        Assert.Equal(8u, FieldDescEncoding.Decode(OddWord, 0, 27));
+        Assert.Equal(8u + 0x800_0000u, FieldDescEncoding.Decode(OddWord, 0, 28));
+
+        Assert.Equal(27, encoding.OffsetBitWidth);
+        Assert.Contains("belongs to the neighbouring field", process.FieldDescCalibration.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void FieldsWithAnOddElementTypeAreReadable()
+    {
+        // The 31% that a one-bit-too-wide window loses: every struct, double and unsigned field.
+        // Position is ELEMENT_TYPE_VALUETYPE (17) and Numbers is SZARRAY (29) — both odd.
+        using SyntheticClrTarget target = SyntheticClrTarget.Build();
+        using LiveProcess process = target.Attach();
+        using ISnapshot snapshot = process.BeginSnapshot();
+
+        var derived = (ClrObject)snapshot.Object(target.DerivedAddress)!;
+
+        Assert.True(derived.TryGetFieldLocation(nameof(FixtureDerived.Position), out ClrFieldLocation location));
+        Assert.Equal(32, location.Offset);
+
+        IClrValue position = derived.Field(nameof(FixtureDerived.Position))!;
+
+        // An inline struct is not a reference, and must not be followed as one.
+        Assert.Null(position.AsObject());
+
+        FixturePoint value = position.Read<FixturePoint>();
+        Assert.Equal(122, value.X);
+        Assert.Equal(183, value.Y);
+
+        Assert.Equal(3, snapshot.Object(target.HolderAddress)!.Field(nameof(FixtureHolder.Numbers))!.AsArray()!.Count);
     }
 
     [Fact]
