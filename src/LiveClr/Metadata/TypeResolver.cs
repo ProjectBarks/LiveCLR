@@ -129,8 +129,12 @@ public sealed class TypeResolver
     private readonly Dictionary<TypeDefinitionHandle, MetadataField[]> _fieldCache = [];
     private readonly Dictionary<TypeDefinitionHandle, string[]> _fieldNameCache = [];
     private readonly Dictionary<TypeDefinitionHandle, string> _nameCache = [];
+    private readonly Dictionary<TypeDefinitionHandle, HashSet<int>> _threadStaticCache = [];
     private readonly Lock _gate = new();
     private Dictionary<string, TypeDefinitionHandle>? _index;
+
+    /// <summary>Shared empty result: almost no type declares a <c>[ThreadStatic]</c> field.</summary>
+    private static readonly HashSet<int> NoThreadStatics = [];
 
     /// <summary>Wrap a reader. The reader must outlive this resolver.</summary>
     public TypeResolver(MetadataReader reader)
@@ -279,6 +283,95 @@ public sealed class TypeResolver
 
         return names;
     }
+
+    /// <summary>
+    /// Tokens of this type's fields carrying <c>[ThreadStatic]</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A thread-local static has storage per thread, and the per-type <c>DynamicStaticsInfo</c>
+    /// bases that answer an ordinary static do NOT address it (analysis doc §14.0, correction 2).
+    /// The runtime marks such a field in its <c>FieldDesc</c>, but that struct is unpublished, so
+    /// this — the attribute the compiler emitted, read out of the target's own metadata — is the
+    /// authority, and <see cref="LiveClr.Runtime.StaticsCalibration"/> uses it as the ground truth
+    /// it derives the runtime's own marker bit against.
+    /// </para>
+    /// <para>
+    /// Empty for almost every type, so the empty result is shared rather than allocated. Cached
+    /// like the field list: the answer is a pure function of the blob (Process tier, §8.8).
+    /// </para>
+    /// </remarks>
+    public IReadOnlySet<int> GetThreadStaticFieldTokens(TypeDefinitionHandle handle)
+    {
+        lock (_gate)
+        {
+            if (_threadStaticCache.TryGetValue(handle, out HashSet<int>? hit)) return hit;
+        }
+
+        HashSet<int> tokens = NoThreadStatics;
+        try
+        {
+            foreach (FieldDefinitionHandle fieldHandle in _reader.GetTypeDefinition(handle).GetFields())
+            {
+                FieldDefinition field = _reader.GetFieldDefinition(fieldHandle);
+                if ((field.Attributes & FieldAttributes.Static) == 0) continue;
+                if (!HasThreadStaticAttribute(field)) continue;
+
+                if (ReferenceEquals(tokens, NoThreadStatics)) tokens = [];
+                tokens.Add(MetadataTokens.GetToken(fieldHandle));
+            }
+        }
+        catch (BadImageFormatException)
+        {
+            // A row that cannot be read must not be reported as "no [ThreadStatic] here" for the
+            // rest of the process lifetime: that is a cached false negative on the one guard whose
+            // failure mode is a confident wrong ADDRESS (§14.0). Return empty, cache nothing, and
+            // let the caller's own refusals stand.
+            return NoThreadStatics;
+        }
+
+        lock (_gate)
+        {
+            if (_threadStaticCache.TryGetValue(handle, out HashSet<int>? published)) return published;
+            _threadStaticCache[handle] = tokens;
+        }
+
+        return tokens;
+    }
+
+    private bool HasThreadStaticAttribute(FieldDefinition field)
+    {
+        foreach (CustomAttributeHandle handle in field.GetCustomAttributes())
+        {
+            EntityHandle constructor = _reader.GetCustomAttribute(handle).Constructor;
+
+            EntityHandle owner = constructor.Kind switch
+            {
+                HandleKind.MemberReference => _reader.GetMemberReference((MemberReferenceHandle)constructor).Parent,
+                HandleKind.MethodDefinition =>
+                    _reader.GetMethodDefinition((MethodDefinitionHandle)constructor).GetDeclaringType(),
+                _ => default,
+            };
+
+            (string Namespace, string Name) named = owner.Kind switch
+            {
+                HandleKind.TypeReference when !owner.IsNil => Named(_reader.GetTypeReference((TypeReferenceHandle)owner)),
+                HandleKind.TypeDefinition when !owner.IsNil =>
+                    Named(_reader.GetTypeDefinition((TypeDefinitionHandle)owner)),
+                _ => default,
+            };
+
+            if (named.Name == "ThreadStaticAttribute" && named.Namespace == "System") return true;
+        }
+
+        return false;
+    }
+
+    private (string Namespace, string Name) Named(TypeReference reference) =>
+        (_reader.GetString(reference.Namespace), _reader.GetString(reference.Name));
+
+    private (string Namespace, string Name) Named(TypeDefinition definition) =>
+        (_reader.GetString(definition.Namespace), _reader.GetString(definition.Name));
 
     /// <summary>Find a declared field by name.</summary>
     public bool TryGetField(TypeDefinitionHandle handle, string name, out MetadataField field)

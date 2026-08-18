@@ -38,10 +38,10 @@ That is correct for a debugger and wrong for something sampling a live applicati
 | CLR layout source | version-matched DAC | **cDAC descriptor, self-described** |
 | Consistency model | suspend / snapshot | snapshot-scoped page cache, or PSS |
 | Torn-traversal detection | — | structural, inspectable |
-| Static fields | ✅ | ❌ *(see [Limits](#limits))* |
+| Static fields | ✅ | ✅ *(derived from the target; see [Limits](#limits))* |
 | Maturity | production, years | **new** |
 
-They compose: ClrMD is the recommended cold-path bootstrap for the one thing LiveClr cannot do.
+They compose: ClrMD remains a fine cold-path bootstrap for anything LiveClr declines.
 
 ## How it works
 
@@ -88,7 +88,7 @@ Honest boundaries, each traceable to what the .NET 9 descriptor actually publish
 
 | Gap | Status |
 | --- | --- |
-| **Static field addresses** | **Not implemented — but no longer believed impossible.** This row previously read "no MT auxiliary data, and no known-address managed static to calibrate against". Both were wrong. `m_pAuxiliaryData` is at `MethodTable+0x20`, and `DynamicStaticsInfo` sits immediately below it carrying a **back-pointer to the MethodTable at `aux-8`** — a self-validating anchor, measured at 3033/3033 across 25 assemblies on a live .NET 9 process, with GC statics at `aux-0x18` and non-GC at `aux-0x10`, masked `& ~1`. Verified end to end by reading `Environment.s_processId` and getting the target's real PID. See `docs/analysis.md` §14. Until it is implemented here, supply via `IClrStaticRootSource` — ClrMD, suspended, once at connect. |
+| **Static field addresses** | **Implemented, derived from the target, verified live.** `DynamicStaticsInfo` sits immediately below `MethodTable.m_pAuxiliaryData` and carries a **back-pointer to the MethodTable** — a self-validating anchor. Nothing on the path is hardcoded: the auxiliary slot and the `MTFlags2` gate bit are derived JOINTLY at attach as the one pair that agrees on every sampled type, and which of the two blobs is the GC one is decided by reading real statics through both. Measured against a live .NET 9 game: **3033/3033** gate-set types anchored, **0/9250** gate-clear, 17,540 statics resolving to valid objects with **0 garbage**, and **0** through the wrong base. `Environment.s_processId` reads back the target's real PID. **Four cases are refused rather than answered**, each of which otherwise returns a confident wrong address: thread statics (28), RVA statics (243), open generic definitions (83), and any type whose anchor does not close. "Class never initialised" is reported as its own state, not as null. See `docs/analysis.md` §14. `IClrStaticRootSource` still works and is consulted second. |
 | Instance field offsets | Derived, not read. `FieldDesc` is unpublished, so the encoding is calibrated against eight published `System.Exception` offsets. Converges or refuses; never guesses. **Not yet verified against a live runtime.** |
 | `AppDomain` / `Assembly` walk | Unpublished. Seed a module, or resolve any object and its module registers itself. |
 | Segmented `ModuleLookupMap` | `Count`/`Next` unpublished. Correct for single-segment maps; degrades to "not found" beyond, never to a wrong answer. |
@@ -97,9 +97,9 @@ Honest boundaries, each traceable to what the .NET 9 descriptor actually publish
 The recurring principle: **a confident wrong answer is worse than a miss.** Where the runtime does
 not publish enough to be certain, LiveClr declines.
 
-> **Status: new and not yet battle-tested.** The design is validated by 322 tests against synthetic
-> and recorded memory, and the technique is validated against a real game — but *this*
-> implementation has not yet been run against a live target end to end. Treat it accordingly.
+> **Status: new and not yet battle-tested.** The design is validated by 359 tests against synthetic
+> and recorded memory. The statics path has been run against a live .NET 9 target end to end; the
+> rest of the stack has not. Treat it accordingly.
 
 ## Requirements
 

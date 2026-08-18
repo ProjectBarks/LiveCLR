@@ -254,6 +254,14 @@ public sealed class ClrTypeInfo
     public int ComponentSize { get; }
 
     /// <summary><c>EEClass.InternalCorElementType</c> (§5.2: 64).</summary>
+    /// <remarks>
+    /// <b>This is what the runtime stores, which is not the same as what the ECMA-335 signature
+    /// for the type would say.</b> Measured on .NET 9 (§17): across 12,283 loaded method tables
+    /// in a live process, <c>ELEMENT_TYPE_STRING</c> appears exactly zero times —
+    /// <c>System.String</c>'s own <c>EEClass</c> reports <c>ELEMENT_TYPE_CLASS</c> (0x12). Arrays
+    /// do report <c>SZARRAY</c>/<c>ARRAY</c>, so <see cref="IsArray"/> can be read from here;
+    /// <see cref="IsString"/> deliberately cannot.
+    /// </remarks>
     public ClrElementType ElementType { get; }
 
     /// <summary>Method table of an array's element type, when it could be identified and validated.</summary>
@@ -273,10 +281,31 @@ public sealed class ClrTypeInfo
     public System.Reflection.TypeAttributes? TypeAttributes { get; }
 
     /// <summary>True for <c>SZARRAY</c> and multidimensional arrays.</summary>
+    /// <remarks>
+    /// Unlike <see cref="IsString"/> this one CAN come from the element type, and that is a
+    /// measurement rather than an assumption: the published <c>ObjectArrayMethodTable</c> reports
+    /// <c>SZARRAY</c> live, and every array reached in a live walk did too (§17).
+    /// </remarks>
     public bool IsArray => ElementType is ClrElementType.SzArray or ClrElementType.Array;
 
     /// <summary>True for <c>System.String</c>.</summary>
-    public bool IsString => ElementType is ClrElementType.String;
+    /// <remarks>
+    /// <para>
+    /// <b>Not <c>ElementType == String</c>, which is dead on every real runtime.</b> That was the
+    /// original spelling and it made <see cref="ClrValue.AsString"/> return null for every string
+    /// in a live process: CoreCLR does not put the string marker in <c>EEClass</c>'s norm type
+    /// (§17 — 0 of 12,283 live method tables report <c>ELEMENT_TYPE_STRING</c>, and
+    /// <c>System.String</c>'s own reports <c>ELEMENT_TYPE_CLASS</c>).
+    /// </para>
+    /// <para>
+    /// Identity comes from <see cref="ClrTypeSystem.StringMethodTable"/> instead — the
+    /// <c>StringMethodTable</c> global the descriptor publishes (§5.3), which is not a decoded
+    /// property of a type but the runtime naming the one method table that IS
+    /// <c>System.String</c>. See <see cref="ClrTypeSystem.IsStringType"/> for what happens on a
+    /// runtime that does not publish it.
+    /// </para>
+    /// </remarks>
+    public bool IsString => _system.IsStringType(this);
 
     /// <summary>
     /// True for <c>System.Collections.Generic.List&lt;T&gt;</c>.
@@ -414,12 +443,14 @@ public sealed class ClrTypeSystem
         IRuntimeContractTarget target,
         ClrLayouts layouts,
         ModuleMetadataCache metadata,
-        IClrFieldLayoutSource fieldLayout)
+        IClrFieldLayoutSource fieldLayout,
+        RuntimeStaticFieldSource staticFields)
     {
         _target = target;
         Layouts = layouts;
         MetadataCache = metadata;
         FieldLayout = fieldLayout;
+        StaticFields = staticFields;
     }
 
     /// <summary>Descriptor-resolved CLR offsets.</summary>
@@ -430,6 +461,17 @@ public sealed class ClrTypeSystem
 
     /// <summary>How named instance fields become offsets.</summary>
     public IClrFieldLayoutSource FieldLayout { get; }
+
+    /// <summary>
+    /// How named STATIC fields become addresses, straight out of the target (§14).
+    /// </summary>
+    /// <remarks>
+    /// Refuses on a runtime whose statics chain could not be derived, which is when a
+    /// caller-supplied <see cref="IClrStaticRootSource"/> takes over — the same "runtime first,
+    /// caller-supplied second" order <see cref="CompositeFieldLayoutSource"/> uses, and for the
+    /// same reason: a runtime that can answer is always believed over a hand-maintained table.
+    /// </remarks>
+    public RuntimeStaticFieldSource StaticFields { get; }
 
     /// <summary>
     /// Whether <see cref="ClrTypeInfo.ComponentSize"/> can be believed.
@@ -443,6 +485,25 @@ public sealed class ClrTypeSystem
     /// degrade to unavailable instead of indexing with a wrong stride.
     /// </remarks>
     public bool ComponentSizeIsTrusted { get; private set; }
+
+    /// <summary>
+    /// The method table that IS <c>System.String</c>, from the descriptor's
+    /// <c>StringMethodTable</c> global (§5.3), or 0 when the runtime does not publish one.
+    /// </summary>
+    /// <remarks>
+    /// Resolved in <see cref="Seed"/> and validated as a method table before it is believed, so a
+    /// stale or garbage global cannot become the identity oracle. This is a published FACT about
+    /// the target rather than a property decoded out of a type, which is what makes it a better
+    /// answer to "is this a string" than anything in <c>MTFlags</c> or <c>EEClass</c>.
+    /// </remarks>
+    public ulong StringMethodTable { get; private set; }
+
+    /// <summary>Whether <see cref="StringMethodTable"/> came from the descriptor.</summary>
+    /// <remarks>
+    /// False means <see cref="IsStringType"/> is running on corroborated evidence rather than on
+    /// a published fact, which a diagnostic should be able to say out loud.
+    /// </remarks>
+    public bool StringIdentityIsPublished => StringMethodTable != 0;
 
     /// <summary>Modules discovered so far, by <c>Module*</c>.</summary>
     public IReadOnlyCollection<ClrModuleInfo> Modules
@@ -516,6 +577,49 @@ public sealed class ClrTypeSystem
         ComponentSizeIsTrusted =
             ComponentSizeAgrees(memory, "StringMethodTable", 2) &&
             ComponentSizeAgrees(memory, "ObjectArrayMethodTable", Layouts.PointerSize);
+
+        // String identity, taken from the runtime naming its own String method table rather than
+        // decoded out of a flag word (§17). Validated as a method table first: a global that does
+        // not round-trip is not evidence of anything.
+        if (_target.TryGetGlobalPointer("StringMethodTable", out ulong stringSlot) &&
+            memory.TryReadPointer(stringSlot, out ulong stringMethodTable) &&
+            stringMethodTable != 0 &&
+            IsMethodTable(memory, stringMethodTable))
+        {
+            StringMethodTable = stringMethodTable;
+        }
+    }
+
+    /// <summary>
+    /// Whether a type is <c>System.String</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Preferred route: the published global.</b> <see cref="StringMethodTable"/> is the
+    /// runtime pointing at the one method table that is <c>System.String</c>, so identity is a
+    /// pointer comparison against ground truth rather than an inference from a decoded flag.
+    /// </para>
+    /// <para>
+    /// <b>Fallback, when the runtime publishes no such global: two independent signals must
+    /// agree.</b> ECMA-335 metadata must name the type <c>System.String</c> — that name is
+    /// resolved through <c>Module.TypeDefToMethodTableMap</c> and the mapped image, touching no
+    /// runtime flags at all — AND <c>MTFlags</c> must report a component size of 2, which is the
+    /// shape CoreCLR's own <c>MethodTable::IsString</c> tests (<c>HasComponentSize</c> and not an
+    /// array and stride 2). Measured live, exactly one of 12,283 method tables satisfies each of
+    /// those, and it is the same one both times (§17). Neither signal alone is used: a name can
+    /// be declared by any assembly, and a stride of 2 on a non-array is a shape rather than an
+    /// identity.
+    /// </para>
+    /// </remarks>
+    internal bool IsStringType(ClrTypeInfo type)
+    {
+        ArgumentNullException.ThrowIfNull(type);
+
+        if (StringMethodTable != 0) return type.MethodTable == StringMethodTable;
+
+        return type.ComponentSize == 2
+            && !type.IsArray
+            && string.Equals(type.Name, "System.String", StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -711,46 +815,9 @@ public sealed class ClrTypeSystem
         return true;
     }
 
-    /// <summary>
-    /// Resolve <c>MethodTable.EEClassOrCanonMT</c> (§5.2: 40).
-    /// </summary>
-    /// <remarks>
-    /// The slot is a tagged union — an <c>EEClass*</c> for a canonical type, or a pointer to
-    /// the canonical method table for a generic instantiation. The descriptor publishes the
-    /// field but not the tag, so the tag is not assumed: BOTH readings are attempted and
-    /// whichever produces an <c>EEClass</c> whose published <c>MethodTable</c> back-pointer
-    /// (§5.2: 16) closes the loop is the right one. A wrong reading cannot close it.
-    /// </remarks>
-    public bool TryResolveEEClass(IMemoryReader memory, ulong methodTable, out ulong eeClass, out ulong canonicalMethodTable)
-    {
-        eeClass = 0;
-        canonicalMethodTable = methodTable;
-
-        if (!memory.TryReadPointer(methodTable + (ulong)Layouts.MethodTableEEClassOrCanonMtOffset, out ulong slot)) return false;
-        if (slot == 0) return false;
-
-        if (IsEEClassOf(memory, slot, methodTable))
-        {
-            eeClass = slot;
-            return true;
-        }
-
-        ulong canonical = slot & ~3UL;
-        if (canonical == 0 || canonical == methodTable) return false;
-        if (!memory.TryReadPointer(canonical + (ulong)Layouts.MethodTableEEClassOrCanonMtOffset, out ulong nested)) return false;
-        if (!IsEEClassOf(memory, nested, canonical)) return false;
-
-        eeClass = nested;
-        canonicalMethodTable = canonical;
-        return true;
-    }
-
-    private bool IsEEClassOf(IMemoryReader memory, ulong candidate, ulong methodTable)
-    {
-        if (candidate == 0 || (candidate & 3) != 0) return false;
-        return memory.TryReadPointer(candidate + (ulong)Layouts.EEClassMethodTableOffset, out ulong back)
-            && back == methodTable;
-    }
+    /// <inheritdoc cref="ClrLayouts.TryResolveEEClass"/>
+    public bool TryResolveEEClass(IMemoryReader memory, ulong methodTable, out ulong eeClass, out ulong canonicalMethodTable) =>
+        Layouts.TryResolveEEClass(memory, methodTable, out eeClass, out canonicalMethodTable);
 
     private bool ComponentSizeAgrees(IMemoryReader memory, string global, int expected)
     {

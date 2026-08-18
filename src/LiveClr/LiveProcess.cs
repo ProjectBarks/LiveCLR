@@ -34,6 +34,17 @@ public sealed class LiveProcessOptions
     /// <see cref="FieldLayout"/>.
     /// </summary>
     public bool CalibrateFieldOffsets { get; init; } = true;
+
+    /// <summary>
+    /// Whether to derive the statics chain at attach — the <c>MethodTable</c> auxiliary slot, the
+    /// <c>MTFlags2</c> gate bit and the GC/non-GC base order (§14).
+    /// </summary>
+    /// <remarks>
+    /// Costs one pass over CoreLib's loaded types, once. Disable it to rely purely on
+    /// <see cref="StaticRoots"/>; there is no correctness reason to, and the derivation refuses
+    /// rather than guessing on a runtime it cannot measure.
+    /// </remarks>
+    public bool CalibrateStatics { get; init; } = true;
 }
 
 /// <summary>The target could not be prepared for reading. Carries the precise reason.</summary>
@@ -86,6 +97,7 @@ public sealed class LiveProcess : ILiveProcess
         ModuleMetadataCache metadata,
         ClrTypeSystem typeSystem,
         FieldDescCalibration calibration,
+        StaticsCalibration statics,
         LiveProcessOptions options)
     {
         ProcessId = processId;
@@ -98,6 +110,7 @@ public sealed class LiveProcess : ILiveProcess
         MetadataCache = metadata;
         TypeSystem = typeSystem;
         FieldDescCalibration = calibration;
+        StaticsCalibration = statics;
         _options = options;
     }
 
@@ -137,6 +150,15 @@ public sealed class LiveProcess : ILiveProcess
     /// for the Godot table).
     /// </summary>
     public FieldDescCalibration FieldDescCalibration { get; }
+
+    /// <summary>
+    /// The statics-chain derivation performed at attach (§14). Inspect
+    /// <see cref="Runtime.StaticsCalibration.Detail"/> at startup for the same reason as
+    /// <see cref="FieldDescCalibration"/>: whether static fields are readable at all on a given
+    /// runtime is decided here, and it belongs in a startup diagnostic rather than in a null
+    /// halfway through a walk.
+    /// </summary>
+    public StaticsCalibration StaticsCalibration { get; }
 
     /// <inheritdoc/>
     public IReadOnlyCollection<string> ModuleNames => Modules.Names;
@@ -257,11 +279,19 @@ public sealed class LiveProcess : ILiveProcess
             ? new RuntimeFieldLayoutSource(layouts, calibration)
             : new CompositeFieldLayoutSource(new RuntimeFieldLayoutSource(layouts, calibration), options.FieldLayout);
 
-        var typeSystem = new ClrTypeSystem(target, layouts, metadata, fieldLayout);
+        // Statics share the FieldDesc offset bitfield with instance fields, so this cannot run
+        // before that derivation and does not run at all if it failed (§14.1).
+        StaticsCalibration statics = options.CalibrateStatics
+            ? StaticsCalibration.Attempt(memory, target, layouts, metadata, calibration)
+            : StaticsCalibration.NotAttempted;
+
+        var staticFields = new RuntimeStaticFieldSource(layouts, statics, calibration);
+        var typeSystem = new ClrTypeSystem(target, layouts, metadata, fieldLayout, staticFields);
         typeSystem.Seed(memory);
 
         return new LiveProcess(
-            processId, memory, ownsMemory, modules, coreClr, target, layouts, metadata, typeSystem, calibration, options);
+            processId, memory, ownsMemory, modules, coreClr, target, layouts, metadata, typeSystem, calibration,
+            statics, options);
     }
 
     /// <summary>

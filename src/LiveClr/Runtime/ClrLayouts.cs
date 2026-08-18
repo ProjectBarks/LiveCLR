@@ -275,6 +275,79 @@ public sealed class ClrLayouts
     }
 
     /// <summary>
+    /// Resolve <c>MethodTable.EEClassOrCanonMT</c> (§5.2: 40).
+    /// </summary>
+    /// <remarks>
+    /// The slot is a tagged union — an <c>EEClass*</c> for a canonical type, or a pointer to the
+    /// canonical method table for a generic instantiation. The descriptor publishes the field but
+    /// not the tag, so the tag is not assumed: BOTH readings are attempted and whichever produces
+    /// an <c>EEClass</c> whose published <c>MethodTable</c> back-pointer (§5.2: 16) closes the
+    /// loop is the right one. A wrong reading cannot close it.
+    /// <para>
+    /// It lives here rather than on <see cref="ClrTypeSystem"/> because two callers need it and
+    /// neither needs the other's cache: the type system wants the facts it produces, and
+    /// <see cref="StaticsCalibration"/> wants only the verdict, at attach, before any type system
+    /// exists. A second copy of the round trip would be a second thing to keep correct.
+    /// </para>
+    /// </remarks>
+    public bool TryResolveEEClass(
+        IMemoryReader memory, ulong methodTable, out ulong eeClass, out ulong canonicalMethodTable)
+    {
+        ArgumentNullException.ThrowIfNull(memory);
+
+        eeClass = 0;
+        canonicalMethodTable = methodTable;
+
+        if (!memory.TryReadPointer(methodTable + (ulong)MethodTableEEClassOrCanonMtOffset, out ulong slot)) return false;
+        if (slot == 0) return false;
+
+        if (IsEEClassOf(memory, slot, methodTable))
+        {
+            eeClass = slot;
+            return true;
+        }
+
+        ulong canonical = slot & ~3UL;
+        if (canonical == 0 || canonical == methodTable) return false;
+        if (!memory.TryReadPointer(canonical + (ulong)MethodTableEEClassOrCanonMtOffset, out ulong nested)) return false;
+        if (!IsEEClassOf(memory, nested, canonical)) return false;
+
+        eeClass = nested;
+        canonicalMethodTable = canonical;
+        return true;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="methodTable"/> has the SHAPE of one: the
+    /// <c>EEClassOrCanonMT</c> union round-trips and <c>MethodTable.Module</c> leads to a
+    /// non-zero <c>Module.Base</c>.
+    /// </summary>
+    /// <remarks>
+    /// Uncached, and therefore not the route a traversal should take —
+    /// <see cref="ClrTypeSystem.IsMethodTable"/> is. This exists for the attach-time
+    /// derivations, which run before there is a type system to cache into.
+    /// </remarks>
+    public bool IsMethodTableShaped(IMemoryReader memory, ulong methodTable)
+    {
+        ArgumentNullException.ThrowIfNull(memory);
+
+        if (methodTable == 0 || (methodTable & 3) != 0) return false;
+
+        return TryResolveEEClass(memory, methodTable, out _, out _)
+            && memory.TryReadPointer(methodTable + (ulong)MethodTableModuleOffset, out ulong modulePointer)
+            && modulePointer != 0
+            && memory.TryReadPointer(modulePointer + (ulong)ModuleBaseOffset, out ulong moduleBase)
+            && moduleBase != 0;
+    }
+
+    private bool IsEEClassOf(IMemoryReader memory, ulong candidate, ulong methodTable)
+    {
+        if (candidate == 0 || (candidate & 3) != 0) return false;
+        return memory.TryReadPointer(candidate + (ulong)EEClassMethodTableOffset, out ulong back)
+            && back == methodTable;
+    }
+
+    /// <summary>
     /// Address of a <c>ModuleLookupMap</c>'s entry for <paramref name="rid"/>.
     /// </summary>
     /// <remarks>

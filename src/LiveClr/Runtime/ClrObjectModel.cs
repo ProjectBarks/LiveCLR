@@ -71,10 +71,19 @@ public sealed class ClrType : IClrType
     /// The current value of a static field.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Re-read every time, never remembered. §7b.1: the static's SLOT is loader-heap stable,
     /// but the object it points at moved between two observations of the same singleton
-    /// minutes apart. Returns null when no <see cref="IClrStaticRootSource"/> knows the slot —
-    /// see that interface for why the descriptor cannot supply it.
+    /// minutes apart.
+    /// </para>
+    /// <para>
+    /// The runtime is asked first (§14, via <see cref="RuntimeStaticFieldSource"/>) and a
+    /// caller-supplied <see cref="IClrStaticRootSource"/> second — the same order, and the same
+    /// reason, as <see cref="CompositeFieldLayoutSource"/>: a runtime that can answer is believed
+    /// over a hand-maintained table, so a stale address is corrected rather than trusted. Returns
+    /// null when neither can locate the slot; <see cref="ResolveStatic"/> says which refusal it
+    /// was.
+    /// </para>
     /// </remarks>
     public IClrValue? Static(string fieldName)
     {
@@ -84,6 +93,27 @@ public sealed class ClrType : IClrType
         {
             if (!type.TryGetDeclaredField(fieldName, out MetadataField field)) continue;
             if (!field.IsStatic || field.IsLiteral) continue;
+
+            ClrStaticField resolved = _context.TypeSystem.StaticFields.Resolve(_context.Memory, type, fieldName);
+
+            if (resolved.IsResolved)
+            {
+                if (!resolved.IsBoxed) return new ClrValue(_context, resolved.Address, type.GetFieldShape(fieldName));
+
+                // A value-type static lives BOXED in the GC blob (§14.0). Reading the slot as the
+                // declared type would hand back the box pointer as if it were the value, so the
+                // reference is followed and the payload — one object header in — is what the
+                // caller gets. Validated first: a slot that does not address a real object
+                // produces nothing rather than a struct read out of whatever was there.
+                if (!_context.Memory.TryReadPointer(resolved.Address, out ulong box) || box == 0) return null;
+                if (!_context.TypeSystem.TryGetTypeOfObject(_context.Memory, box, out _)) return null;
+
+                return new ClrValue(
+                    _context,
+                    box + (ulong)_context.TypeSystem.Layouts.FirstFieldOffset,
+                    type.GetFieldShape(fieldName));
+            }
+
             if (!_context.StaticRoots.TryGetStaticAddress(_context.Memory, type.Name, fieldName, out ulong address)) continue;
             if (address == 0) continue;
 
@@ -91,6 +121,34 @@ public sealed class ClrType : IClrType
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// What the runtime route made of a static field, refusal reason included.
+    /// </summary>
+    /// <remarks>
+    /// Diagnostic, and deliberately NOT what <see cref="Static"/> returns: the refusals are the
+    /// interesting part (§14.0), and a caller that gets null from <see cref="Static"/> otherwise
+    /// cannot tell "this type has no statics" from "this field is thread-local" from "the class
+    /// has never been initialised". Reports on the type that DECLARES the field, walking
+    /// ancestors as <see cref="Static"/> does.
+    /// </remarks>
+    public ClrStaticField ResolveStatic(string fieldName)
+    {
+        if (fieldName is null) return ClrStaticField.Refused(ClrStaticStatus.NotDeclared);
+        if (_context.IsDisposed) return ClrStaticField.Refused(ClrStaticStatus.NotCalibrated);
+
+        ClrStaticField last = ClrStaticField.Refused(ClrStaticStatus.NotDeclared);
+
+        foreach (ClrTypeInfo type in Info.WithAncestors(_context.Memory))
+        {
+            if (!type.TryGetDeclaredField(fieldName, out MetadataField field) || !field.IsStatic) continue;
+
+            last = _context.TypeSystem.StaticFields.Resolve(_context.Memory, type, fieldName);
+            if (last.IsResolved) return last;
+        }
+
+        return last;
     }
 
     /// <inheritdoc/>

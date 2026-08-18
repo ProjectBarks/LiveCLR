@@ -2750,11 +2750,20 @@ decodes `m_isStatic` (bit 24) and `m_isRVA` (bit 26) and silently skips bit 25. 
 refuse.** Likewise §14.3's recommended design drops `isRVA` entirely, which §14.1 does decode — 243
 RVA statics need their own path.
 
-**Correction 3 — open generic type definitions have no statics storage.** 3,385 GC-dispatched
-statics read `gcRaw == nonGcRaw == 1` (`ArrayPool\`1.s_shared`, `EmptyArray\`1.Value`). The
-instantiation's MethodTable is required. The chain refuses correctly, so this is a *capability* limit
-rather than a correctness bug — but a caller resolving by TypeDef name simply gets nothing, and
-per-instantiation `GenericsStaticsInfo` was not tested.
+**Correction 3 — storage-less statics are mostly *uninitialised classes*, not open generics.**
+~3,747 GC-dispatched statics read a raw base of `1`, and this section originally blamed all of them
+on open generic definitions, generalising from `ArrayPool\`1.s_shared` and `EmptyArray\`1.Value`.
+Measured against the same process during implementation: **only 83 are generic at all.** The rest are
+ordinary non-generic types — `BitConverter.IsLittleEndian`, `DBNull.Value`,
+`JapaneseCalendar.s_defaultInstance` — whose class initialiser simply never ran.
+
+Different fact, different remedy, so they are different statuses. An open generic needs the
+*instantiation's* MethodTable and can never resolve from the definition. An uninitialised class
+resolves **the moment the target touches it** — the address appears on its own. Collapsing the two
+would report a transient state as a permanent capability limit.
+
+Both are refusals rather than wrong answers, so the property holds either way; per-instantiation
+`GenericsStaticsInfo` was still not tested.
 
 Two smaller notes. The gate is **exact and fails safe**: zero of 12,283 types with statics had it
 clear, so there are no false refusals; the 8 gate-set-without-statics are all
@@ -2885,8 +2894,9 @@ defined.
 **But 4.4's offsets are not 4.3's offsets, and nothing predicted that.** Verified layout-changing
 edits between `4.3-stable` and `4.4-stable`, all sitting *above* the fields this project reads:
 
-- `Object` gains `StringName _translation_domain` (`4.4 object.h:680`) — **+8 bytes, shifting every
-  `Node`/`CanvasItem`/`Control` field below it.**
+- `Object` gains `StringName _translation_domain` (`4.4 object.h:680`) — **+8 bytes.** But see the
+  measurement below: **the band actually moves `+0x10`, not `+8`**, and this section's number was
+  wrong in the one direction that was actionable.
 - `Node::Data` gains three bitfield bools plus two translation-domain flags.
 - `CanvasItem` gains two `HashMap` members (`4.4 canvas_item.h:118`) — *after* `visible` (line 98),
   so `visible`'s intra-class offset survives but **the whole `Control` block below moves ~96 bytes.**
@@ -3073,3 +3083,65 @@ refuse correctly — `Engine::get_time_scale` → `NoThisRelativeAccess`; `Node:
   `0xa80` are likewise confirmed with a name attached, independently refuting scry's `0x848`/`0xb18`.
 - The route never touches `property_setget`, so `GodotReflectionSupport`'s 4.6 refusal may be
   stricter than necessary for this path. Whether `method_map` survives 4.6 is **not measured**.
+
+### 15.7 Godot 4.4.1 measured — and §15.1's shift figure was wrong
+
+Four `4.4.1-*` single-precision cells exported and calibrated, three full passes. **The code change
+§15.6 predicted does not exist to be written.** The calibrator carries no version-keyed offset table —
+it derives everything — and `build.ps1`/`lib/grid.mjs` already knew about 4.4. The calibration run
+*was* the entire task. That is a result rather than a shortcut: **4.4 works because nothing aliases.**
+
+No 4.4.1 column was added to `profiles.json` or `GodotAbiProfiles.cs`. Writing the calibrator's own
+output into the answer key is the pass-by-construction §13.11 forbids; it would turn
+`profile.agreement` from an honest SKIP into a tautological PASS.
+
+Release column; debug is `release + 8` throughout, verified uniform on both bindings.
+
+| key | 4.3 | **4.4.1** | Δ vs 4.3 | 4.5 |
+| --- | --- | --- | --- | --- |
+| `node.scriptInstance` | `0x68` | **`0x68`** | — | `0x68` |
+| `node.parent` | `0x128` | **`0x138`** | `+0x10` | `0x128` |
+| `node.childListHead` | `0x150` | **`0x160`** | `+0x10` | `0x148` |
+| `node.name` | `0x1d0` | **`0x1e0`** | `+0x10` | `0x1c0` |
+| `canvasItem.visible` | `0x418` | **`0x428`** | `+0x10` | `0x370` |
+| `control.offset` | `0x4d8` | **`0x548`** | `+0x70` | `0x470` |
+| `control.scale` | `0x508` | **`0x578`** | `+0x70` | `0x4a8` |
+| `control.position` | `0x518` | **`0x588`** | `+0x70` | `0x4b8` |
+| `control.size` | `0x520` | **`0x590`** | `+0x70` | `0x4c0` |
+| `label.text` | `0x8f0` | **`0x968`** | `+0x78` | `0x7f8` |
+| `richTextLabel.text` | `0xa90` | **`0xb50`** | `+0xc0` | `0xa78` |
+
+**Refuted: the inherited shift is `+0x10`, not `+8`.** §15.1 attributed the whole `Node`/`CanvasItem`
+move to `Object`'s new `StringName _translation_domain` and put it at 8 bytes. It measures **16**. A
+second 8 enters above `Node::data.parent` — consistent with §15.1's own aside that `Node::Data` gains
+three bitfield bools and two translation-domain flags, but that observation never reached the number.
+
+**This is the failure mode §15.1 warned about, committed by §15.1 itself.** Patching 4.3's table with
+"+8" would have produced a table wrong on *every* `Node` field and internally plausible enough to
+ship. The prediction was directionally right and quantitatively wrong, and **only the wrong half was
+actionable** — a derived calibrator is unharmed, a hand-patched table is silently broken.
+
+**Confirmed to the byte:** `visible` keeps its intra-class offset and moves with the `Node` band, not
+the `Control` band. The `Control` block moves `0x70 − 0x10` = **exactly 96** beyond the inherited
+shift, matching §15.1's "~96" from two new `CanvasItem` `HashMap` members. `Control::Data` grows 8
+(`label.text` at `+0x78`), i.e. `tooltip_auto_translate_mode`.
+
+**Unpredicted:** `RichTextLabel` gains `0x50` above `text` on top of the `Control` shift. Harmless —
+still derived, still byte-exact — but absent from §15.1's list.
+
+**An independent data point for the `HashMap` size question (§16.5 vs §15.3).** If §15.1's
+identification of the two new `CanvasItem` members as `HashMap`s is right, then the measured 96-byte
+`Control` displacement is a live measurement of `2 × sizeof(HashMap) == 96`, i.e. **48** — agreeing
+with §15.3's source reading, by a completely different route from the stride read. One version, one
+route; it does not settle 4.3 or 4.5.
+
+Verification: `offsets.internal_consistency` passes on all 36 cell-runs; `grid.debug_release_delta`
+holds at the pinned `0x8`; `grid.binding_invariance` passes across the 4.4.1 pair with
+`scriptInstance.ownerBackref` correctly *not compared* (`CSharpInstance` vs `GDScriptInstance`).
+Absent-never-wrong audited independently of `lib/` — **972 node records, 144 text readings, 0 wrong,
+0 invented** across all 12 cells × 3 runs.
+
+One flake, and it is not a 4.4 property: `4.4.1-debug-single-gdscript` derived
+`canvasItem.visible = 0x430` on pass 1 and produced no candidate on passes 2–3 — the only non-clean
+cell-run in 36. When it fires it agrees with its dotnet twin; when it does not, it withholds. Same
+candidate-tie nondeterminism seen on 4.5.
