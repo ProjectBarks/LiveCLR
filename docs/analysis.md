@@ -2390,8 +2390,12 @@ value **only** on `Agree` — a disagreement publishes neither side rather than 
 - **4.6/master already breaks this**: `ClassInfo::property_setget` becomes `AHashMap`. Different walker.
 - `sizeof(MethodBind)` moves with `DEBUG_ENABLED` (`arg_names` is debug-only) — **probe the first few
   qwords for the one landing in the main module's `.text`** rather than hardcoding it. Self-validating.
-- `HashMap` went 48 -> 40 bytes between 4.3 and 4.5.
-- `StringName::_Data` dropped `cname`/`idx` in 4.5; a 4.3 reader must check `cname` first.
+- `HashMap` went 48 -> 40 bytes between **4.4 and 4.5** (not 4.3 and 4.5 — corrected in §15.3, and
+  live-measured on both versions in §16.5). `head_element` moves with it, `+0x18` -> `+0x10`.
+- `StringName::_Data` dropped `cname`/`idx` in 4.5; a 4.3 reader must check `cname` first. **This is
+  right, and §16.5's "backwards" note was right only about the keys it happened to look at** — see
+  the corrected bullet there. Which of `cname`/`name` is populated depends on how the name was
+  interned, not on the version, and a single `ClassDB` walk meets both kinds.
 - **Windows-specific**, but *not* MSVC-specific — see the correction in §13.1. The official templates
   are MinGW-GCC, which still uses the Microsoft x64 calling convention (RCX/RDX), which is why the
   decoder works on them. **Linux** templates use the System V convention (RDI) and the Itanium
@@ -2752,18 +2756,15 @@ RVA statics need their own path.
 
 **Correction 3 — storage-less statics are mostly *uninitialised classes*, not open generics.**
 ~3,747 GC-dispatched statics read a raw base of `1`, and this section originally blamed all of them
-on open generic definitions, generalising from `ArrayPool\`1.s_shared` and `EmptyArray\`1.Value`.
-Measured against the same process during implementation: **only 83 are generic at all.** The rest are
-ordinary non-generic types — `BitConverter.IsLittleEndian`, `DBNull.Value`,
-`JapaneseCalendar.s_defaultInstance` — whose class initialiser simply never ran.
+on open generic definitions, generalising from two examples. Measured during implementation: **only
+83 are generic at all.** The rest are ordinary non-generic types — `BitConverter.IsLittleEndian`,
+`DBNull.Value`, `JapaneseCalendar.s_defaultInstance` — whose class initialiser simply never ran.
 
 Different fact, different remedy, so they are different statuses. An open generic needs the
 *instantiation's* MethodTable and can never resolve from the definition. An uninitialised class
-resolves **the moment the target touches it** — the address appears on its own. Collapsing the two
-would report a transient state as a permanent capability limit.
-
-Both are refusals rather than wrong answers, so the property holds either way; per-instantiation
-`GenericsStaticsInfo` was still not tested.
+resolves **the moment the target touches it**. Collapsing the two would report a transient state as
+a permanent capability limit. Both are refusals rather than wrong answers, so the property holds
+either way.
 
 Two smaller notes. The gate is **exact and fails safe**: zero of 12,283 types with statics had it
 clear, so there are no false refusals; the 8 gate-set-without-statics are all
@@ -2894,9 +2895,9 @@ defined.
 **But 4.4's offsets are not 4.3's offsets, and nothing predicted that.** Verified layout-changing
 edits between `4.3-stable` and `4.4-stable`, all sitting *above* the fields this project reads:
 
-- `Object` gains `StringName _translation_domain` (`4.4 object.h:680`) — **+8 bytes.** But see the
-  measurement below: **the band actually moves `+0x10`, not `+8`**, and this section's number was
-  wrong in the one direction that was actionable.
+- `Object` gains `StringName _translation_domain` (`4.4 object.h:680`) — **+8 bytes.** But §15.7
+  measured the band moving **`+0x10`, not `+8`**: a second 8 enters above `Node::data.parent`. This
+  section's number was wrong in the one direction that was actionable.
 - `Node::Data` gains three bitfield bools plus two translation-domain flags.
 - `CanvasItem` gains two `HashMap` members (`4.4 canvas_item.h:118`) — *after* `visible` (line 98),
   so `visible`'s intra-class offset survives but **the whole `Control` block below moves ~96 bytes.**
@@ -2929,6 +2930,9 @@ a dense scan of `_size` entries — **simpler than the 4.5 walker, not harder.**
   (`4.5 hash_map.h:68`) and empty-base-optimization erases it. Consequence beyond size:
   **`head_element` sits at `+0x18` on 4.3/4.4 and `+0x10` on 4.5+.** (The EBO reasoning is inference;
   the source change is verified and agrees with the project's independently measured 48→40.)
+  **Both numbers are now confirmed on running 4.3 and 4.5 templates, release and debug** — see the
+  corrected §16.5, which briefly claimed the opposite. The EBO reasoning is still inference, but it
+  is inference that predicted a measurement it had not seen.
 - **`StringName::_Data` keeps `cname`/`idx` on 4.4** as well as 4.3, dropped at 4.5, unchanged
   through master. So 4.4 uses the 4.3 reader.
 - **`MethodBind` is unchanged 4.3 → master** — identical member list at every tag; only the guard
@@ -2978,6 +2982,80 @@ ABIs and should not be quoted as one.
 | **4.6** | One `AHashMap` walker + a profile | Simpler than the walk it replaces. Everything else carries over from 4.5. Optionally swap class identity to `_gdtype_ptr` for a better answer. |
 | **4.7 / master** | Re-plumb §13.4 through `GDType` | The class-metadata layer, not the ABI. Decide deliberately rather than extrapolating from 4.6. |
 | **Nothing** | getter decoder, `ObjectDB` anchor | Both premises verified intact at master. |
+
+### 15.7 4.4 measured — §15.1's shape held, its arithmetic did not
+
+Four `4.4.1-*` single-precision cells built from stock `4.4.1-stable` editors and export templates, and
+calibrated three passes with one frozen driver binary. §15.6 asked for "a version-gate entry + one
+calibration run"; **the calibration run was the whole of it.** The calibrator carries no version-keyed
+offset table, so nothing needed a 4.4 entry to derive 4.4's layout — the one place in the codebase that
+*is* version-gated (`GodotReflectionSupport.TryResolve`) is not on the calibration path at all.
+
+Release column, beside 4.3 and 4.5. Debug is `release + 8` on 4.4.1 as everywhere else.
+
+| key | 4.3 | **4.4.1** | Δ vs 4.3 | 4.5 |
+| --- | --- | --- | --- | --- |
+| `node.scriptInstance` | `0x68` | **`0x68`** | — | `0x68` |
+| `node.parent` | `0x128` | **`0x138`** | `+0x10` | `0x128` |
+| `node.childListHead` | `0x150` | **`0x160`** | `+0x10` | `0x148` |
+| `node.name` | `0x1d0` | **`0x1e0`** | `+0x10` | `0x1c0` |
+| `canvasItem.visible` | `0x418` | **`0x428`** | `+0x10` | `0x370` |
+| `control.offset` | `0x4d8` | **`0x548`** | `+0x70` | `0x470` |
+| `control.scale` | `0x508` | **`0x578`** | `+0x70` | `0x4a8` |
+| `control.position` | `0x518` | **`0x588`** | `+0x70` | `0x4b8` |
+| `control.size` | `0x520` | **`0x590`** | `+0x70` | `0x4c0` |
+| `label.text` | `0x8f0` | **`0x968`** | `+0x78` | `0x7f8` |
+| `richTextLabel.text` | `0xa90` | **`0xb50`** | `+0xc0` | `0xa78` |
+
+**The headline held.** Every field survives and every address moves: 10 of 11 keys differ from 4.3, and
+the one that does not (`node.scriptInstance`) is the single `Object` member sitting *above*
+`_translation_domain`. A 4.3 table reused on 4.4 would have been wrong on everything except the
+`ScriptInstance` pointer, which is the trap §15.1 named.
+
+**The arithmetic did not.** §15.1 attributed the `Node`/`CanvasItem` shift to `_translation_domain`
+alone and put it at **+8**. It measures **+0x10**. A second eight bytes enters above
+`Node::data.parent` — consistent with §15.1's own aside that `Node::Data` gains bitfield bools and two
+translation-domain flags, but the section did not carry that into its number. **Anyone who had patched
+4.3's table with "+8" would have been eight bytes wrong on every `Node` field and would have had a
+plausible-looking table to show for it.** Recorded as a refutation because it is one: the prediction was
+directionally right and quantitatively wrong, and only the wrong half was actionable.
+
+Three predictions confirmed to the byte:
+
+- **`visible` keeps its intra-class offset.** It moved with the `Node` band (`+0x10`), not with the
+  `Control` band — exactly as predicted from the two new `CanvasItem` members landing *after* it.
+- **The `Control` block moves ~96.** It moves `0x70 − 0x10 = 0x60` = **96 bytes** beyond the inherited
+  shift. §15.1 predicted "~96" from two new `CanvasItem` `HashMap` members; the measurement is exact.
+- **`Control::Data` grows 8.** `label.text` moves `+0x78`, i.e. `+0x70` inherited plus `0x8` —
+  `tooltip_auto_translate_mode`.
+
+One growth was not predicted: **`RichTextLabel` gains `0x50` above `text`** on top of the `Control`
+shift (`+0xc0` total). Harmless — the field is still derived and every string decodes byte-exact — but
+it is not in §15.1's list.
+
+> **A side-effect worth handing to whoever resolves the §16.5 `HashMap` contradiction.** If §15.1's
+> identification of the two new `CanvasItem` members as `HashMap`s is right, then a 96-byte growth is a
+> live, independent measurement of `2 × sizeof(HashMap) == 96` on 4.4 — i.e. **48**, agreeing with
+> §15.3's source reading. It is measured through a completely different route from §16.5's (member
+> displacement in a derived offset table, not a stride read off a walker), and it says nothing about 4.3
+> or 4.5. It is one data point on one version, not a resolution.
+
+**What the run showed.** All four cells export and run. Across three passes: `offsets.internal_consistency`
+passes on all twelve cell-runs; `grid.debug_release_delta` passes at the pinned `0x8`;
+`grid.binding_invariance` passes across the 4.4.1 dotnet/gdscript pair with no key disagreeing. Eleven of
+twelve cell-runs are clean; the twelfth is `4.4.1-debug-single-gdscript`, where `canvasItem.visible`
+derived as `0x430` on one pass and produced no candidate on the other two. That is the candidate-tie
+flakiness already known on this scene, not a 4.4 property — when it fires it agrees with its `dotnet`
+twin, and when it does not it withholds. **Absent-never-wrong holds:** the tree rebuilt from `parentPtr`
+alone reproduces the authored scene on every 4.4.1 cell-run, and all 48 reported `text` values are
+byte-exact with zero invented and zero withheld.
+
+**One version gate is genuinely wrong for 4.4, and it is not on this path.**
+`GodotReflectionSupport.TryResolve` selects `ClassDbLayout.Godot43` only when
+`minor == OldestSupportedMinor`, so **4.4 falls through to `Godot45`** — the 40-byte `HashMap` and a
+`StringName::_Data` reader that does not look for `cname`, both wrong for 4.4 per §15.3. It should be
+`minor <= 4`. Nothing in the calibrator reaches this code today, so it cost the grid nothing; it would
+cost the §16 `ClassDB` cross-check correctness the moment that is wired up on a 4.4 target.
 
 ---
 
@@ -3066,82 +3144,328 @@ refuse correctly — `Engine::get_time_scale` → `NoThisRelativeAccess`; `Node:
 
 ### 16.5 Shipped-code defects and doc corrections this run produced
 
-- **`MethodBindProbe.DefaultProbeSlots = 8` refuses 100% of probes on all 8 cells.**
-  `sizeof(MethodBind)` measures **0x48 release / 0x58 debug** on both versions, so the method pointer
-  is at slot 9 or 11. The default needs to be ≥ 12. §13.7 predicted the shift; the shipped default
-  never accommodated it.
-- **`ClassDbLayout.Godot43.HashMapSize = 48` is wrong** — `sizeof(HashMap)` measures **40 bytes on
-  both 4.3 and 4.5** (`num_elements` at head+0x14, head at map+16). Harmless today because the
-  element chain never uses it. Note this **contradicts §15.3's source-derived 48→40 boundary at
-  4.4→4.5**; source and measurement disagree and the discrepancy is unresolved.
-- **§13.7's "a 4.3 reader must check `cname` first" is backwards.** On 4.3 `_Data.cname@+0x8` exists
-  but is **null** for class names; `name@+0x10` is populated. Checking `cname` first is harmless only
-  because it is null.
-- `ClassInfo::method_map` is at `+0x30` (4.5) / `+0x38` (4.3), found structurally, never hardcoded.
+- **`MethodBindProbe.DefaultProbeSlots = 8` refused 100% of probes on all 8 cells. FIXED — the
+  default is now 12.** `sizeof(MethodBind)` measures **0x48 release / 0x58 debug** on both versions,
+  so the method pointer is at slot 9 or 11. §13.7 predicted the shift; the shipped default never
+  accommodated it. Re-measured across all eight cells × two getters, 16 probes: **16/16 refused at
+  8, 16/16 resolve at 12**, one `.text` hit each and never two. The recovered getters decode to
+  `Label::get_text` `+0x7f8` and `CanvasItem::is_visible` `+0x370` on 4.5-release (RVA `0x15d11b0` /
+  `0x139f520`, matching §13.2 exactly) and `+0x8f0` / `+0x418` on 4.3-release — `get_text` on 4.3
+  still needing `WindowBytes = 0x200`, as §16.3 says. Debug `is_visible` abstains with
+  `NoThisRelativeAccess`, which is the §16.2 structural limit, not a regression.
+
+- **`ClassDbLayout.Godot43.HashMapSize = 48` was NOT wrong; this section was.** The claim above that
+  `sizeof(HashMap)` "measures 40 bytes on both 4.3 and 4.5" was arithmetic, not measurement:
+  `num_elements at head+0x14` is real and **version-invariant**, but `head at map+16` is the 4.5
+  layout assumed onto 4.3, and `0x10 + 0x14 + 4 = 40` then comes out the same on any version by
+  construction. It is §13.11's family again — a computation with no way to come out otherwise.
+
+  Re-measured properly, by walking all registered `ClassInfo`s and accepting a map head only where
+  `head_element`, `tail_element` and `num_elements` all agree with a fully traversed chain:
+
+  | | 4.3 (869 classes) | 4.5 (908 classes) |
+  | --- | --- | --- |
+  | validated head offsets in `ClassInfo` | `+0x38, +0x68, +0x98, +0xc8, +0xf8, +0x130, +0x160` | `+0x30, +0x58, +0x80, +0xa8, +0xd0, +0x100, +0x128, +0x150` |
+  | strides | `0x30 ×4`, `0x38`, `0x30` | `0x28 ×4`, `0x30`, `0x28 ×2` |
+  | `head_element` within `HashMap` | **`+0x18`** | **`+0x10`** |
+  | `sizeof(HashMap)` | **48** | **40** |
+
+  Identical on release and debug. The one widened stride in each row is
+  `ClassInfo::property_list` — a `List`, one pointer — sitting between `signal_map` and
+  `property_map`, exactly where `class_db.h` puts it; and 4.5's extra eighth map is
+  `virtual_methods_compat`, which 4.3 does not have. So the offsets do not merely average out to the
+  right stride, they reproduce `ClassInfo` member-for-member on both versions.
+
+  **§15.3 is right and was right for the right reason**: 4.3/4.4 hold `Allocator element_alloc` as a
+  member, 4.5+ inherit it privately and EBO erases it. No code change was needed. The naming was the
+  actual defect, and `ClassDbLayout` now carries `HashMapHeadElement` beside `HashMapSize` with a
+  test asserting both, so the two cannot be conflated again.
+
+- **§13.7's "a 4.3 reader must check `cname` first" is correct; the "backwards" note previously here
+  was true only of the keys it looked at.** Which of `cname`/`name` is populated is decided by the
+  interning route, not the version: `StringName`'s `StaticCString` constructor sets `cname` and
+  leaves `name` empty, while the `String`/`const char *` constructors do the reverse.
+  `_Data::get_name()` is literally `cname ? String(cname) : name`.
+
+  Measured on 4.3, and it cuts both ways inside one walk. The **class-name** keys of
+  `ClassDB::classes` have `cname@+0x8` **null** and `name@+0x10` populated — the original
+  observation, and correct. The **method-name** keys of `ClassInfo::method_map` are the opposite:
+  `cname` holds the ASCII (`"get_text"`, `"is_visible"`) and `name` is **null**. A `name`-only 4.3
+  reader therefore reads every class name correctly and every method name as the empty string, so it
+  resolves no bind by name at all — which is precisely the failure §13.7 warned about. On 4.5 there
+  is no `cname` and `name` is always populated, so the question disappears.
+
+- `ClassInfo::method_map` is at **`+0x20` on both 4.3 and 4.5** (`api` padded to 8, `inherits_ptr`,
+  `class_ptr`, `gdextension`). The `+0x30` (4.5) / `+0x38` (4.3) recorded here previously are the
+  offsets of that map's **`head_element` field**, which is what the structural search actually finds
+  — and their 8-byte difference *is* the `HashMap` shift, not a `ClassInfo` change. Mislabelling
+  them is what made the size look version-independent.
 - **`label.text 0x7f8` and `richTextLabel.text 0xa78` are now stock-template verified by name**, so
   `profiles.json`'s `stockTemplateVerified: false` can be retired for those two. 4.5-debug `0x800` /
   `0xa80` are likewise confirmed with a name attached, independently refuting scry's `0x848`/`0xb18`.
 - The route never touches `property_setget`, so `GodotReflectionSupport`'s 4.6 refusal may be
   stricter than necessary for this path. Whether `method_map` survives 4.6 is **not measured**.
+- **Unreconciled, and left that way: the 4.3 class count.** §16.1 above records 870 classes on 4.3;
+  the re-measurement gets **869**, on all four 4.3 cells, from a chain that walks clean end to end
+  with every `next`/`prev` round-tripping — so it is not a truncated walk, which would have failed
+  rather than come up one short. 4.5's 908 reproduces exactly. One of the two 4.3 numbers is a
+  transcription slip and there is no evidence here saying which, so both are recorded.
 
-### 15.7 Godot 4.4.1 measured — and §15.1's shift figure was wrong
+---
 
-Four `4.4.1-*` single-precision cells exported and calibrated, three full passes. **The code change
-§15.6 predicted does not exist to be written.** The calibrator carries no version-keyed offset table —
-it derives everything — and `build.ps1`/`lib/grid.mjs` already knew about 4.4. The calibration run
-*was* the entire task. That is a result rather than a shortcut: **4.4 works because nothing aliases.**
+## 17. 4.6 measured — §15 named the wrong hard part, and missed the only thing that broke
 
-No 4.4.1 column was added to `profiles.json` or `GodotAbiProfiles.cs`. Writing the calibrator's own
-output into the answer key is the pass-by-construction §13.11 forbids; it would turn
-`profile.agreement` from an honest SKIP into a tautological PASS.
+Four `4.6.3-*` single-precision cells built from stock `4.6.3-stable` editors and export templates,
+calibrated three passes with one frozen driver binary, plus a live `ClassDB` probe on release and
+debug with 4.5 run through the same probe as a control.
 
-Release column; debug is `release + 8` throughout, verified uniform on both bindings.
+§15.6 budgeted 4.6 at "one `AHashMap` walker + a profile". The `AHashMap` walker was the easy half and
+§15.2 was right that it is simpler than the walk it replaces. **Neither of the two things that
+actually cost the day is in §15 at all**, and the more expensive one is not in `ClassDB`.
 
-| key | 4.3 | **4.4.1** | Δ vs 4.3 | 4.5 |
-| --- | --- | --- | --- | --- |
-| `node.scriptInstance` | `0x68` | **`0x68`** | — | `0x68` |
-| `node.parent` | `0x128` | **`0x138`** | `+0x10` | `0x128` |
-| `node.childListHead` | `0x150` | **`0x160`** | `+0x10` | `0x148` |
-| `node.name` | `0x1d0` | **`0x1e0`** | `+0x10` | `0x1c0` |
-| `canvasItem.visible` | `0x418` | **`0x428`** | `+0x10` | `0x370` |
-| `control.offset` | `0x4d8` | **`0x548`** | `+0x70` | `0x470` |
-| `control.scale` | `0x508` | **`0x578`** | `+0x70` | `0x4a8` |
-| `control.position` | `0x518` | **`0x588`** | `+0x70` | `0x4b8` |
-| `control.size` | `0x520` | **`0x590`** | `+0x70` | `0x4c0` |
-| `label.text` | `0x8f0` | **`0x968`** | `+0x78` | `0x7f8` |
-| `richTextLabel.text` | `0xa90` | **`0xb50`** | `+0xc0` | `0xa78` |
+### 17.1 The break: `CowData`'s header grew, and the failure looks like the wrong thing entirely
 
-**Refuted: the inherited shift is `+0x10`, not `+8`.** §15.1 attributed the whole `Node`/`CanvasItem`
-move to `Object`'s new `StringName _translation_domain` and put it at 8 bytes. It measures **16**. A
-second 8 enters above `Node::data.parent` — consistent with §15.1's own aside that `Node::Data` gains
-three bitfield bools and two translation-domain flags, but that observation never reached the number.
+Godot 4.6 rewrites `core/templates/cowdata.h` to carry a **capacity** field:
 
-**This is the failure mode §15.1 warned about, committed by §15.1 itself.** Patching 4.3's table with
-"+8" would have produced a table wrong on *every* `Node` field and internally plausible enough to
-ship. The prediction was directionally right and quantitatively wrong, and **only the wrong half was
-actionable** — a derived calibrator is unharmed, a hand-patched table is silently broken.
+```
+4.2-4.5   [refcount][size][data ...]                  DATA_OFFSET = 16, count at buf-0x8
+4.6       [refcount][capacity][size][pad][data ...]   DATA_OFFSET = 32, count at buf-0x10
+```
 
-**Confirmed to the byte:** `visible` keeps its intra-class offset and moves with the `Node` band, not
-the `Control` band. The `Control` block moves `0x70 − 0x10` = **exactly 96** beyond the inherited
-shift, matching §15.1's "~96" from two new `CanvasItem` `HashMap` members. `Control::Data` grows 8
-(`label.text` at `+0x78`), i.e. `tooltip_auto_translate_mode`.
+`DATA_OFFSET` is `align(SIZE_OFFSET + 8, Memory::MAX_ALIGN)`, and `MAX_ALIGN` is
+`alignof(max_align_t)` — **16** on the toolchain the official Windows templates are built with, which
+is what makes it 32 rather than 24. Measured directly, on the header in front of the interned UTF-32
+buffer for `"RootHarness"`: `[1][13][12][pad]` on 4.6.3 against `[1][12]` on 4.5.
 
-**Unpredicted:** `RichTextLabel` gains `0x50` above `text` on top of the `Control` shift. Harmless —
-still derived, still byte-exact — but absent from §15.1's list.
+**Why this was expensive out of proportion to its size.** The calibrator hardcoded `buf - 8` in two
+places. With it, a 4.6 target reports *no `StringName` slot anywhere for the walk root* — so the first
+symptom is `found no StringName slot for "RootHarness"`, which reads as "this scene is not in memory"
+or "the scan is broken", not as "one constant is eight bytes off". Every string in the process is
+still there and still perfectly decodable; the reader simply reads the padding as the length and
+rejects every buffer. **A version boundary that makes strings vanish is much harder to recognise than
+one that makes them wrong.**
 
-**An independent data point for the `HashMap` size question (§16.5 vs §15.3).** If §15.1's
-identification of the two new `CanvasItem` members as `HashMap`s is right, then the measured 96-byte
-`Control` displacement is a live measurement of `2 × sizeof(HashMap) == 96`, i.e. **48** — agreeing
-with §15.3's source reading, by a completely different route from the stride read. One version, one
-route; it does not settle 4.3 or 4.5.
+It is now derived rather than gated: from the raw byte-scan hits for two anchor names of **different
+lengths**, take the displacement that holds each name's element count. One name proves nothing — small
+integers are everywhere in a header — but a displacement that reads `12` in front of `"RootHarness"`
+*and* `11` in front of `"AlphaPanel"` is the size field. Two equally supported displacements are
+refused rather than resolved by preference. On 4.3/4.4.1/4.5 it derives `-0x8` and changes nothing; on
+4.6.3 it derives `-0x10`, on all four cells, every pass.
 
-Verification: `offsets.internal_consistency` passes on all 36 cell-runs; `grid.debug_release_delta`
-holds at the pinned `0x8`; `grid.binding_invariance` passes across the 4.4.1 pair with
-`scriptInstance.ownerBackref` correctly *not compared* (`CSharpInstance` vs `GDScriptInstance`).
-Absent-never-wrong audited independently of `lib/` — **972 node records, 144 text readings, 0 wrong,
-0 invented** across all 12 cells × 3 runs.
+### 17.2 The child-list walk survives, and §15.4's `LocalVector` worry was aimed at the wrong list
 
-One flake, and it is not a 4.4 property: `4.4.1-debug-single-gdscript` derived
-`canvasItem.visible = 0x430` on pass 1 and produced no candidate on passes 2–3 — the only non-clean
-cell-run in 36. When it fires it agrees with its dotnet twin; when it does not, it withholds. Same
-candidate-tie nondeterminism seen on 4.5.
+`Node::Data::children` is **still `HashMap<StringName, Node *>`** at `4.6 node.h:202`. The
+`LocalVector` §15.4 flagged is `CanvasItem`'s `canvas_item_children` — the *draw-order* list, which
+this project has never walked. `ChildListWalk`'s premise (`next` at `+0`, payload at `+0x18`) is the
+`HashMapElement` layout, not a `List` layout, and it is intact: `childList.next = 0` /
+`childList.node = 0x18` derive identically on 4.6.3 and on every earlier version, and the walk
+reproduces the authored tree on all twelve 4.6.3 cell-runs.
+
+One difference worth recording: the 4.6.3 walk reaches **29** nodes where 4.3/4.4.1/4.5 reach **27**,
+for the same 25-node authored scene. The extra two are engine-internal children, and the harness's
+`walkCount` contract handles it without a change.
+
+### 17.3 The derived table, beside 4.5
+
+Release column; debug is `release + 8` on every key, on both bindings, in all three passes.
+
+| key | 4.5 | **4.6.3** | Δ |
+| --- | --- | --- | --- |
+| `node.scriptInstance` | `0x68` | **`0x60`** | `-0x08` |
+| `node.parent` | `0x128` | **`0xf8`** | `-0x30` |
+| `node.childListHead` | `0x148` | **`0x118`** | `-0x30` |
+| `node.name` | `0x1c0` | **`0x190`** | `-0x30` |
+| `canvasItem.visible` | `0x370` | **`0x348`** | `-0x28` |
+| `control.offset` | `0x470` | **`0x448`** | `-0x28` |
+| `control.scale` | `0x4a8` | **`0x480`** | `-0x28` |
+| `control.position` | `0x4b8` | **`0x498`** | `-0x20` |
+| `control.size` | `0x4c0` | **`0x4a0`** | `-0x20` |
+| `label.text` | `0x7f8` | **`0x7d8`** | `-0x20` |
+| `richTextLabel.text` | `0xa78` | **`0xa80`** | **`+0x08`** |
+
+**All eleven differ from 4.5.** That is the check that matters: a profile aliased onto 4.5's would
+have been wrong on every key, and — unlike 4.4, where `node.scriptInstance` survived unchanged and
+could have masked the mistake — there is no key here that would have looked right by luck.
+
+Two §15.4 predictions land **exactly**, and the arithmetic is the evidence rather than the claim:
+
+- **`Control::Data` gains 8 bytes between `scale` and `position`.** `offset` and `scale` move `-0x28`;
+  `position` and `size` move `-0x20`. The 8-byte step between them is `pivot_offset_ratio`, a
+  single-precision `Vector2`. §15.4 named the member; the split in the deltas is where it shows up.
+- **`CanvasItem` grows 8 bytes above `visible`.** The `Node` band moves `-0x30` and `visible` moves
+  only `-0x28`, so `visible`'s offset *within* `CanvasItem` is 8 higher. That is
+  `List<CanvasItem*> children_items` + `Element *C` (two pointers) becoming
+  `LocalVector<CanvasItem*>` + `uint32_t index_in_parent` (24 bytes) — `+8`, to the byte.
+
+One growth was **not** predicted, and it is the same shape as the one 4.4 sprang: `RichTextLabel`
+gains `0x28` above `text`, which is why it is the single key that moves *up* while everything else
+moves down. Harmless — the field is derived and every string decodes byte-exact — but §15 does not
+contain it. **Whatever else changes between Godot versions, `RichTextLabel`'s private preamble grows
+every time.**
+
+`Object` shrinking was predicted and is confirmed in direction only: `node.scriptInstance` moves
+`-0x08` while the whole `Node` band moves `-0x30`, so the shrink is split either side of
+`script_instance` and §15.4's one-line account of it ("`Variant script` removed, five bools collapsed")
+does not add up to `0x30` on its own. Recorded as directionally right, quantitatively unexplained.
+
+### 17.4 `ClassDB` at 4.6 — three maps convert, not one, and `ClassInfo` moves
+
+Live probe, 4.6.3 release and debug, with 4.5 as a control through the identical code:
+
+| | 4.5 | **4.6.3** |
+| --- | --- | --- |
+| classes enumerated | 908 | **959** |
+| seed uniqueness (`Label` / `CanvasItem`) | 1 of 11 / 1 of 4 | **1 of 10 / 1 of 6** |
+| `sizeof(HashMap)` | 40 | **40** |
+| `HashMap::head_element` | `+0x10` | **`+0x10`** |
+| `ClassInfo::method_map` | `+0x20` | **`+0x28`** |
+| `AHashMap`s found per `ClassInfo` | **0** | **3** (`+0x78`, `+0xb8`, `+0x100` release) |
+| `sizeof(AHashMap)` | n/a | **24** |
+| `sizeof(MethodBind)` rel/dbg | `0x48` / `0x58` | **`0x48` / `0x58`** |
+| method-pointer slot rel/dbg | 9 / 11 | **9 / 11** |
+
+- **`sizeof(HashMap)` is 40 on 4.6, measured and not assumed.** The instruction was to measure rather
+  than inherit 4.5's number, and the measurement agrees with 4.5. It is worth stating as a result
+  because the surrounding structure did *not* carry over.
+- **`method_map` moves to `+0x28`.** `ClassInfo` gains `const GDType *gdtype` between `class_ptr` and
+  `gdextension` (`class_db.h:126`). §16.5's "`method_map` is at `+0x20` on both 4.3 and 4.5" was true
+  of both versions it named and is false at 4.6.
+  **And the trap §16.5 fell into is still armed here.** The quantity a structural search actually
+  finds is the `head_element` *field's* offset inside `ClassInfo`, and that is `+0x38` on **both** 4.3
+  and 4.6 — for two unrelated reasons (`0x20 + 0x18` against `0x28 + 0x10`). Reading `+0x38` on both
+  and concluding "unchanged" is §16.5's mistake with the operands swapped.
+- **§15.2 named one converted map; there are three.** `constant_map` and `signal_map` become
+  `AHashMap` at 4.6 as well as `property_setget` (`class_db.h:132,139,157`).
+- **`AHashMap` is 24 bytes**, and that number is a by-product rather than an assertion: the gap
+  between the two validated `HashMap` heads that straddle `constant_map` is `0x40` = one 40-byte
+  `HashMap` plus one 24-byte `AHashMap`. A dense scan of the first 8 entries of `Object`'s
+  `constant_map` reads back `NOTIFICATION_POSTINITIALIZE`, `NOTIFICATION_PREDELETE`,
+  `NOTIFICATION_EXTENSION_RELOADED`, `CONNECT_DEFERRED`, … — real keys, in registration order.
+- **The control is what makes the `AHashMap` count evidence.** The identical detector — both storage
+  pointers non-null and aligned, capacity a power of two at or above `INITIAL_CAPACITY`, size within
+  it, the index spanning its full capacity — finds three per `ClassInfo` on 4.6 and **zero** across all
+  908 of 4.5's. A predicate that matched everywhere would have proved nothing.
+- **The getter decoder is unchanged and now cross-checks 4.6 at the shipped defaults.**
+  `Label::get_text` decodes `+0x7d8` and `CanvasItem::is_visible` decodes `+0x348` at the **default**
+  `WindowBytes = 0x40` — both matching the independently calibrated offsets exactly, with a name
+  attached. 4.3 needed `0x200` for `get_text`; 4.6 does not. Debug `is_visible` abstains with
+  `NoThisRelativeAccess`, which is §16.2's structural limit, not a regression.
+
+### 17.5 4.6 gives back `_gdtype_ptr` and `_ancestry`, exactly as §15.4 said
+
+Both measured on the live walk root, by content rather than by a computed offset:
+
+- **`_gdtype_ptr` at `Object+0xb8`** (release; `+0xc0` debug). One pointer chase yields
+  `name = "Control"`, and the `super_type` chain terminates correctly:
+  `Control -> CanvasItem -> Node -> Object`. Nothing at any offset satisfies the same test on 4.5,
+  which is the control. Its position is consistent with the rest: `script_instance` at `0x60`, then
+  two 40-byte `HashMap`s, lands exactly on `0xb8`.
+- **`_ancestry` at `Object+0x58`** (release; `+0x60` debug), reading **`0x32`** — precisely
+  `NODE | CANVAS_ITEM | CONTROL` (`1<<1 | 1<<4 | 1<<5`) for a `Control`. It is the only dword in the
+  whole object header whose low 15 bits carry that combination. On 4.5 the same sweep's only hit is
+  `0x7ff7` — every bit set, which is not an ancestry mask and is exactly the false positive a loose
+  predicate produces.
+
+Both remain **optional** and neither is wired in: RTTI already answers class identity on every
+version, and §13.11's `CanvasItem` gate works. They are recorded because they are cheap, strictly
+better, and because `_ancestry` in particular would reduce a `__si_class_type_info::__base_type` walk
+to one masked read.
+
+### 17.6 What this says about 4.7 — and it is not "extrapolate"
+
+Scoped to 4.6.3 deliberately. What the 4.6 work revealed about 4.7, from source only, no template run:
+
+- `ClassInfo` at 4.7 loses `StringName name` and `StringName inherits` entirely. §15.5 already said so
+  and it is confirmed; **4.6 is the transitional tag carrying both `name` and `gdtype`.**
+- The 4.6 measurement adds one thing §15.5 did not have: `ClassInfo::gdtype` **already exists at 4.6**
+  and already points at a `GDType` whose `name` and `super_type` chain read correctly. So the 4.7
+  re-plumb can be written and validated **against a 4.6 target**, where both routes are present and
+  can be required to agree, before any 4.7 template is involved. That is a far better position than
+  porting blind.
+- Nothing here licenses a 4.7 profile. `Object`, `CanvasItem` and `Control` were not examined at 4.7,
+  and 4.6 has just demonstrated that the version-to-version offset deltas are not guessable — every
+  single key moved, one of them in the opposite direction to all the others.
+
+### 17.7 The run, and the one thing not in this repository
+
+Three passes over the full 16-cell grid with one frozen driver. **`offsets.internal_consistency`
+passes on all twelve 4.6.3 cell-runs; `grid.debug_release_delta` passes at the pinned `0x8` and
+`grid.binding_invariance` passes across the 4.6.3 `dotnet`/`gdscript` pair, in all three passes.**
+Eleven of the twelve 4.6.3 cell-runs are clean; the twelfth withholds `richTextLabel.text` on a
+candidate tie — the flakiness T3 is fixing, and the reason it reads as a failure rather than a
+declared skip is exactly T3's `_notes.Add`-instead-of-`Decline()` defect.
+
+**Absent-never-wrong holds.** Independently of the harness's own checks, every node's path was rebuilt
+from `parentPtr` **alone** — `childPtrs` never read — and every reported `nodes[].text` compared
+codepoint by codepoint against the authored scene: **48 cell-runs, 0 invented, 0 wrong**, with three
+cell-runs declining to publish a parent offset at all and therefore publishing no tree.
+
+**The `CowData` fix is not in this repository.** `Godot.External.Calibrator/` was owned by concurrent
+work, so the three-line change it needs — derive the size distance in `RootLocator`, and let
+`TextCalibrator` follow it instead of holding its own `SizeOffset = 8` — was made and run in a private
+copy of that project. Every 4.6 number above came from a driver built from that copy. **Without it the
+four 4.6.3 cells calibrate nothing at all**, so this is the one outstanding dependency, and it is a
+patch to hand over rather than a design question.
+
+---
+
+## 18. String identity — the EEClass norm type is dead on every live target
+
+Found by a downstream consumer, not by a test: **`IClrValue.AsString()` returned null for every
+string on every real process.**
+
+`ClrTypeInfo.IsString` gated on `EEClass.InternalCorElementType == ELEMENT_TYPE_STRING`. Measured
+across **12,283 validated MethodTables** on a live .NET 9 target, that value appears **zero times**.
+`System.String`'s own EEClass reports `ELEMENT_TYPE_CLASS` (0x12).
+
+**The category-mask theory that replaced it was also wrong.** `System.String`'s `MTFlags` are
+`0x80000002` — has-component-size, stride 2, and category bits `0x00000000`, **identical to an
+ordinary class**. There is no string category to read, because CoreCLR's own
+`MethodTable::IsString` is a **shape** test, not a category test. So no measured constant would have
+worked here. (The `0x000F0000` field genuinely does carry identity for other kinds — `0x40000`
+valuetype, `0x60000` primitive, `0xC0000` interface, `0xA0000` szarray — confirmed over ~1,400 types.
+Strings are the exception, which is exactly why guessing from the general rule failed.)
+
+**The fix is descriptor-published rather than measured.** The descriptor publishes a
+`StringMethodTable` global (§5.3 `pointer_data[10]`); identity is now a pointer comparison against
+it, after validating that it round-trips as a method table. Where a runtime omits that global, the
+fallback demands **two independent signals** — the ECMA-335 name *and* an `MTFlags` component stride
+of 2 — each of which selects exactly **1 of 12,283** live MethodTables, and the same one.
+
+Ground truth outside the process: `ReleaseInfoManager._instance` now reads `Commit "59260271"`,
+`Version "v0.107.1"`, matching `release_info.json` on disk. Before the fix, three nulls. Controls
+hold — `Environment.s_processId` is *not* decoded as a string, and `String.Empty` reads `""` rather
+than null.
+
+### 18.1 Why the tests could not see it
+
+**The fixture synthesized an EEClass that agreed with the code.** `RecordedMemoryBuilder` wrote
+`ELEMENT_TYPE_STRING` because that is what the implementation looked for, so test and code encoded
+the same premise and their agreement was never evidence.
+
+This is §13.11 species 1, and it **survived a targeted audit that found eleven other instances** —
+because it is a *fixture-versus-reality* mismatch rather than an unfalsifiable assertion. The test
+could fail. It just tested a world that does not exist. Worth adding to §13.11's question: not only
+*what input would make this red*, but **does any real target ever produce the input this test
+feeds?**
+
+The fixture now writes the measured norm type, and reverting it reddens a test that exists to say so.
+
+**Fixture honesty limit, recorded rather than papered over:** it still does not synthesize the
+`MTFlags` **category** bits (live `ObjectArray` is `0x810A0008`; the fixture writes `0x80000008`).
+Nothing reads them today, but a future category-based predicate must measure before trusting the
+fixture there.
+
+### 18.2 `IsList` has the same defect — proved, deliberately not fixed
+
+`IsList` is a name-prefix match, and names come from inverting `TypeDefToMethodTableMap`, which holds
+**typical instantiations only**. Live: 75 of 555 walked objects have no name at all, and **9 of 9
+slots whose ECMA-335 signature declares `List<T>` returned null from `AsList()`**.
+
+The canonical MethodTable (`List<__Canon>`) is not in the map either, and shares **no EEClass** with
+the typical instantiation (0 of 75 matched) — so there is no cheap descriptor route back to the
+definition, and none was invented. It is pinned as a **documented limitation with a falsifiable
+test** instead.
+
+`AsObject`, `AsArray` and `IsArray` were checked on the same run and are **not** affected: arrays do
+report `SZARRAY` live, 555 objects typed cleanly, and `System.String[]` elements decode.
